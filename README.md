@@ -1,21 +1,31 @@
 # 飞牛 Docker Telegram 远程管理机器人
 
-建议把机器人做成 Docker Hub 镜像。飞牛端只保留 `docker-compose.yml`，直接拉镜像运行，不需要在飞牛上构建，也不需要重启飞牛整机。
+建议把机器人做成远程镜像。飞牛端只保留 `docker-compose.yml`，直接拉镜像运行，不需要在飞牛上构建，也不需要重启飞牛整机。
 
-## 1. GitHub 自动推送到 Docker Hub
+## 1. GitHub 自动发布镜像
 
 项目内置了 GitHub Actions 工作流：
 
 ```text
-.github/workflows/docker-hub.yml
+.github/workflows/docker-publish.yml
 ```
 
-推送到 `main` 分支，或推送 `v*` tag 时，会自动构建并推送 Docker Hub 镜像：
+推送到 `main` 分支，或推送 `v*.*.*` tag 时，会自动构建并推送镜像。
+
+默认一定推送 GitHub Container Registry：
 
 ```text
-your-dockerhub-username/fn-docker-tg-bot:latest
-your-dockerhub-username/fn-docker-tg-bot:sha-xxxxxxx
-your-dockerhub-username/fn-docker-tg-bot:v1.0.0
+ghcr.io/yanganan/fn-docker-tg-bot:latest
+ghcr.io/yanganan/fn-docker-tg-bot:sha-xxxxxxx
+ghcr.io/yanganan/fn-docker-tg-bot:v1.0.0
+```
+
+如果仓库配置了 Docker Hub secrets，还会同步推送 Docker Hub：
+
+```text
+yanganan/fn-docker-tg-bot:latest
+yanganan/fn-docker-tg-bot:sha-xxxxxxx
+yanganan/fn-docker-tg-bot:v1.0.0
 ```
 
 支持的平台：
@@ -27,9 +37,9 @@ linux/arm64
 
 飞牛一般使用 `linux/amd64`，如果是 ARM 设备也能直接拉同一个镜像。
 
-## 2. GitHub 仓库配置
+## 2. Docker Hub 配置
 
-在 GitHub 仓库里配置两个 Secrets：
+如果只用 GHCR，可以不配置 Docker Hub。需要同步 Docker Hub 时，在 GitHub 仓库里配置两个 Secrets：
 
 ```text
 DOCKERHUB_USERNAME
@@ -52,8 +62,8 @@ GitHub 仓库 -> Settings -> Secrets and variables -> Actions -> New repository 
 
 ```bash
 docker login
-docker build -t your-dockerhub-username/fn-docker-tg-bot:latest .
-docker push your-dockerhub-username/fn-docker-tg-bot:latest
+docker build -t yanganan/fn-docker-tg-bot:latest .
+docker push yanganan/fn-docker-tg-bot:latest
 ```
 
 ## 4. 飞牛端部署
@@ -63,7 +73,7 @@ docker push your-dockerhub-username/fn-docker-tg-bot:latest
 需要修改这些配置：
 
 ```yaml
-image: your-dockerhub-username/fn-docker-tg-bot:latest
+image: ghcr.io/yanganan/fn-docker-tg-bot:latest
 
 environment:
   TELEGRAM_TOKEN: "你的机器人token"
@@ -90,7 +100,7 @@ docker compose logs -f docker-tg-bot
 
 ## 5. 后续更新
 
-后续只需要把代码推到 GitHub `main` 分支，GitHub Actions 会自动推送 Docker Hub。
+后续只需要把代码推到 GitHub `main` 分支，GitHub Actions 会自动发布镜像。
 
 飞牛端更新机器人镜像：
 
@@ -109,7 +119,7 @@ docker compose up -d
 - `/bot_info`：查看机器人运行信息
 - `/bot_restart`：重启机器人进程
 
-如果使用 Docker Hub 镜像，`/bot_restart` 只会重启当前镜像里的代码。代码有更新时，仍然需要先在飞牛执行 `docker compose pull && docker compose up -d`。
+如果使用远程镜像，`/bot_restart` 只会重启当前镜像里的代码。代码有更新时，仍然需要先在飞牛执行 `docker compose pull && docker compose up -d`。
 
 ## 7. 注意事项
 

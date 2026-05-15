@@ -1,7 +1,7 @@
 services:
   docker-tg-bot:
     build: .
-    image: your-dockerhub-username/fn-docker-tg-bot:latest
+    image: yanganan/fn-docker-tg-bot:latest
     container_name: docker-tg-bot
     restart: unless-stopped
     environment:
