@@ -23,9 +23,9 @@ ghcr.io/yanganan/fn-docker-tg-bot:v1.0.0
 如果仓库配置了 Docker Hub secrets，还会同步推送 Docker Hub：
 
 ```text
-yanganan/fn-docker-tg-bot:latest
-yanganan/fn-docker-tg-bot:sha-xxxxxxx
-yanganan/fn-docker-tg-bot:v1.0.0
+xavieryy/fn-docker-tg-bot:latest
+xavieryy/fn-docker-tg-bot:sha-xxxxxxx
+xavieryy/fn-docker-tg-bot:v1.0.0
 ```
 
 支持的平台：
@@ -62,8 +62,8 @@ GitHub 仓库 -> Settings -> Secrets and variables -> Actions -> New repository 
 
 ```bash
 docker login
-docker build -t yanganan/fn-docker-tg-bot:latest .
-docker push yanganan/fn-docker-tg-bot:latest
+docker build -t xavieryy/fn-docker-tg-bot:latest .
+docker push xavieryy/fn-docker-tg-bot:latest
 ```
 
 ## 4. 飞牛端部署
