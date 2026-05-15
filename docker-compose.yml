@@ -1,0 +1,25 @@
+services:
+  docker-tg-bot:
+    image: your-dockerhub-username/fn-docker-tg-bot:latest
+    container_name: docker-tg-bot
+    restart: unless-stopped
+    environment:
+      # 必填：Telegram Bot Token。
+      TELEGRAM_TOKEN: "123456:replace_me"
+
+      # 必填：你的 Telegram 用户 ID。多个用户用 ALLOWED_USER_IDS。
+      ALLOWED_USER_ID: "123456789"
+      # ALLOWED_USER_IDS: "123456789,987654321"
+
+      # 必填：飞牛宿主机上 docker compose 服务目录。
+      DOCKER_COMPOSE_DIR: "/vol1/1000/docker-services"
+
+      # 可选：compose 文件不是默认文件名时填写。
+      # DOCKER_COMPOSE_FILE: "/vol1/1000/docker-services/docker-compose.yml"
+
+      COMMAND_TIMEOUT: "120"
+      LOG_TAIL: "80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /vol1/1000/docker-services:/vol1/1000/docker-services
+    working_dir: /app

@@ -1,0 +1,18 @@
+services:
+  docker-tg-bot:
+    build: .
+    image: your-dockerhub-username/fn-docker-tg-bot:latest
+    container_name: docker-tg-bot
+    restart: unless-stopped
+    environment:
+      TELEGRAM_TOKEN: "123456:replace_me"
+      ALLOWED_USER_ID: "123456789"
+      # ALLOWED_USER_IDS: "123456789,987654321"
+      DOCKER_COMPOSE_DIR: "/vol1/1000/docker-services"
+      # DOCKER_COMPOSE_FILE: "/vol1/1000/docker-services/docker-compose.yml"
+      COMMAND_TIMEOUT: "120"
+      LOG_TAIL: "80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /vol1/1000/docker-services:/vol1/1000/docker-services
+    working_dir: /app
