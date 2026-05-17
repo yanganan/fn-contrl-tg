@@ -11,6 +11,7 @@ import docker
 import psutil
 from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
+from telegram.error import TelegramError
 from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, Filters, MessageHandler, Updater
 
 
@@ -26,6 +27,9 @@ DOCKER_COMPOSE_DIR = os.getenv("DOCKER_COMPOSE_DIR", "/opt/docker-services")
 DOCKER_COMPOSE_FILE = os.getenv("DOCKER_COMPOSE_FILE", "")
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "120"))
 LOG_TAIL = int(os.getenv("LOG_TAIL", "80"))
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "").strip()
+TELEGRAM_CONNECT_TIMEOUT = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "15"))
+TELEGRAM_READ_TIMEOUT = float(os.getenv("TELEGRAM_READ_TIMEOUT", "30"))
 MESSAGE_LIMIT = 3200
 PENDING_ACTIONS = {}
 CALLBACK_ACTIONS = {}
@@ -963,22 +967,35 @@ def add_handlers(dp):
 
 
 def set_bot_commands(updater: Updater):
-    updater.bot.set_my_commands(
-        [
-            BotCommand("start", "打开 Docker 管理菜单"),
-            BotCommand("menu", "打开功能菜单"),
-            BotCommand("help", "查看帮助和完整命令"),
-            BotCommand("status", "查看 compose 服务状态"),
-            BotCommand("services", "列出 compose 服务"),
-            BotCommand("ps", "列出 Docker 容器"),
-            BotCommand("images", "列出 Docker 镜像"),
-            BotCommand("volumes", "列出 Docker 存储卷"),
-            BotCommand("system_df", "查看 Docker 磁盘占用"),
-            BotCommand("server_info", "查看服务器资源状态"),
-            BotCommand("bot_info", "查看机器人运行信息"),
-            BotCommand("bot_restart", "重启机器人进程"),
-        ]
-    )
+    try:
+        updater.bot.set_my_commands(
+            [
+                BotCommand("start", "打开 Docker 管理菜单"),
+                BotCommand("menu", "打开功能菜单"),
+                BotCommand("help", "查看帮助和完整命令"),
+                BotCommand("status", "查看 compose 服务状态"),
+                BotCommand("services", "列出 compose 服务"),
+                BotCommand("ps", "列出 Docker 容器"),
+                BotCommand("images", "列出 Docker 镜像"),
+                BotCommand("volumes", "列出 Docker 存储卷"),
+                BotCommand("system_df", "查看 Docker 磁盘占用"),
+                BotCommand("server_info", "查看服务器资源状态"),
+                BotCommand("bot_info", "查看机器人运行信息"),
+                BotCommand("bot_restart", "重启机器人进程"),
+            ]
+        )
+    except TelegramError as e:
+        print(f"警告：设置 Telegram 命令菜单失败，机器人将继续启动：{e}", flush=True)
+
+
+def telegram_request_kwargs():
+    request_kwargs = {
+        "connect_timeout": TELEGRAM_CONNECT_TIMEOUT,
+        "read_timeout": TELEGRAM_READ_TIMEOUT,
+    }
+    if TELEGRAM_PROXY_URL:
+        request_kwargs["proxy_url"] = TELEGRAM_PROXY_URL
+    return request_kwargs
 
 
 def main():
@@ -987,7 +1004,7 @@ def main():
     if not ALLOWED_USER_IDS:
         raise RuntimeError("请在 .env 中配置 ALLOWED_USER_ID 或 ALLOWED_USER_IDS")
 
-    updater = Updater(TELEGRAM_TOKEN, use_context=True)
+    updater = Updater(TELEGRAM_TOKEN, use_context=True, request_kwargs=telegram_request_kwargs())
     add_handlers(updater.dispatcher)
     set_bot_commands(updater)
     updater.start_polling()

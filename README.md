@@ -79,6 +79,10 @@ environment:
   TELEGRAM_TOKEN: "你的机器人token"
   ALLOWED_USER_ID: "你的Telegram用户ID"
   DOCKER_COMPOSE_DIR: "/vol1/1000/docker-services"
+  # 飞牛无法直连 Telegram 时填写代理，例如：
+  # TELEGRAM_PROXY_URL: "http://192.168.1.2:7890"
+  TELEGRAM_CONNECT_TIMEOUT: "15"
+  TELEGRAM_READ_TIMEOUT: "30"
 
 volumes:
   - /var/run/docker.sock:/var/run/docker.sock
@@ -127,3 +131,4 @@ docker compose up -d
 - 删除容器、删除卷、清理镜像等危险操作，脚本里已经加了二次确认。
 - `DOCKER_COMPOSE_DIR` 必须和 volumes 挂载路径一致，否则机器人容器内找不到 compose 服务目录。
 - 如果你的 compose 服务目录不是 `/vol1/1000/docker-services`，同时改 `DOCKER_COMPOSE_DIR` 和 volumes 第二行。
+- 如果日志里出现 `api.telegram.org` 连接超时，说明飞牛容器无法直连 Telegram，需要配置 `TELEGRAM_PROXY_URL`。
