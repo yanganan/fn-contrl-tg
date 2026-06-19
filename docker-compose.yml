@@ -21,6 +21,15 @@ services:
       LOG_TAIL: "80"
       LOG_LEVEL: "INFO"
 
+      # Phase 2: 监控
+      ENABLE_EVENT_MONITOR: "true"
+      EVENT_IGNORE: "watchtower,cadvisor"
+      ENABLE_RESOURCE_MONITOR: "true"
+      DISK_THRESHOLD: "85"
+      MEM_THRESHOLD: "90"
+      CPU_THRESHOLD: "95"
+      ALERT_COOLDOWN: "1800"
+
       # 可选：飞牛无法直连 Telegram 时配置代理。
       # 常见 HTTP 代理示例：http://192.168.1.2:7890
       # 常见 SOCKS5 代理示例：socks5://192.168.1.2:7891
