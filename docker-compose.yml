@@ -19,6 +19,7 @@ services:
 
       COMMAND_TIMEOUT: "120"
       LOG_TAIL: "80"
+      LOG_LEVEL: "INFO"
 
       # 可选：飞牛无法直连 Telegram 时配置代理。
       # 常见 HTTP 代理示例：http://192.168.1.2:7890

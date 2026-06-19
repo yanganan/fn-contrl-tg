@@ -1,8 +1,11 @@
+import logging
 import os
+import shlex
 import shutil
 import signal
-import shlex
 import subprocess
+import sys
+import threading
 import time
 import uuid
 from functools import wraps
@@ -13,6 +16,15 @@ from dotenv import load_dotenv
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.error import TelegramError
 from telegram.ext import CallbackContext, CallbackQueryHandler, CommandHandler, Filters, MessageHandler, Updater
+
+
+# ─── 日志系统 (#5) ───────────────────────────────────────────
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    stream=sys.stdout,
+)
+logger = logging.getLogger("docker-tg-bot")
 
 
 load_dotenv()
@@ -31,11 +43,58 @@ TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "").strip()
 TELEGRAM_CONNECT_TIMEOUT = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "15"))
 TELEGRAM_READ_TIMEOUT = float(os.getenv("TELEGRAM_READ_TIMEOUT", "30"))
 MESSAGE_LIMIT = 3200
+
+# ─── Token 存储 + 过期清理线程 (#2) ──────────────────────────
 PENDING_ACTIONS = {}
 CALLBACK_ACTIONS = {}
+CALLBACK_TOKEN_TTL = 600   # callback token 有效期 10 分钟
+PENDING_TOKEN_TTL = 300    # 确认 token 有效期 5 分钟
+TOKEN_CLEANUP_INTERVAL = 300  # 清理间隔 5 分钟
+
 COMPOSE_BIN = None
 
-client = docker.from_env()
+# ─── 操作并发锁 (#9) ─────────────────────────────────────────
+_operation_lock = threading.Lock()
+
+
+# ─── Docker 客户端延迟初始化 (#4) ────────────────────────────
+_docker_client = None
+_docker_client_lock = threading.Lock()
+
+
+def get_docker_client():
+    """延迟初始化 Docker 客户端，支持自动重连。"""
+    global _docker_client
+    if _docker_client is None:
+        with _docker_client_lock:
+            if _docker_client is None:
+                try:
+                    _docker_client = docker.from_env()
+                    _docker_client.ping()
+                    logger.info("Docker 客户端连接成功")
+                except Exception as e:
+                    _docker_client = None
+                    raise RuntimeError(f"无法连接 Docker: {e}")
+    return _docker_client
+
+
+# ─── Token 过期清理 (#2) ─────────────────────────────────────
+def cleanup_expired_tokens():
+    """后台线程：定期清理过期的 token，防止内存泄漏。"""
+    while True:
+        time.sleep(TOKEN_CLEANUP_INTERVAL)
+        try:
+            now = time.time()
+            expired_cb = [k for k, v in CALLBACK_ACTIONS.items() if now - v["created"] > CALLBACK_TOKEN_TTL]
+            expired_pa = [k for k, v in PENDING_ACTIONS.items() if now - v["created"] > PENDING_TOKEN_TTL]
+            for k in expired_cb:
+                CALLBACK_ACTIONS.pop(k, None)
+            for k in expired_pa:
+                PENDING_ACTIONS.pop(k, None)
+            if expired_cb or expired_pa:
+                logger.debug(f"清理过期 token: callback={len(expired_cb)}, pending={len(expired_pa)}")
+        except Exception as e:
+            logger.warning(f"Token 清理线程异常: {e}", exc_info=True)
 
 
 def restricted(func):
@@ -44,29 +103,62 @@ def restricted(func):
         user = update.effective_user
         if not user or user.id not in ALLOWED_USER_IDS:
             reply(update, "无操作权限。")
+            logger.warning(f"未授权访问: user_id={user.id if user else '?'}, username={user.username if user else '?'}")
             return
+        logger.info(f"用户 {user.id} ({user.username or '?'}) 调用 {func.__name__}")
         try:
             return func(update, context)
         except ValueError as e:
+            logger.info(f"{func.__name__} 业务异常: {e}")
             reply(update, str(e))
         except Exception as e:
+            logger.error(f"{func.__name__} 未捕获异常: {e}", exc_info=True)
             reply(update, f"操作失败：{e}")
 
     return wrapper
 
 
+# ─── 消息发送：callback 时优先编辑原消息 (#6) ─────────────────
 def reply(update: Update, text: str, markup=None, parse_mode=None):
+    """发送消息。callback_query 场景优先编辑原消息，减少刷屏。"""
     if update.callback_query:
+        try:
+            update.callback_query.edit_message_text(text, reply_markup=markup, disable_web_page_preview=True, parse_mode=parse_mode)
+            return
+        except Exception:
+            # 消息太旧或内容相同无法编辑，降级为新消息
+            pass
         update.callback_query.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True, parse_mode=parse_mode)
     elif update.message:
         update.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True, parse_mode=parse_mode)
 
 
 def edit_or_reply(update: Update, text: str, markup=None):
+    """编辑 callback 消息；非 callback 场景发送新消息。"""
     if update.callback_query:
-        update.callback_query.edit_message_text(text, reply_markup=markup, disable_web_page_preview=True)
+        try:
+            update.callback_query.edit_message_text(text, reply_markup=markup, disable_web_page_preview=True)
+        except Exception:
+            reply(update, text, markup)
     else:
         reply(update, text, markup)
+
+
+def send_block(update: Update, title: str, body: str):
+    """发送操作结果（始终新消息，保留历史记录）。"""
+    body = body or "(无输出)"
+    chunks = [body[i : i + MESSAGE_LIMIT] for i in range(0, len(body), MESSAGE_LIMIT)]
+    for index, chunk in enumerate(chunks):
+        suffix = f" ({index + 1}/{len(chunks)})" if len(chunks) > 1 else ""
+        _send_new_message(update, f"{title}{suffix}\n{chunk}")
+
+
+def _send_new_message(update: Update, text: str, markup=None):
+    """强制发送新消息（不编辑原消息）。"""
+    if update.callback_query:
+        update.callback_query.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
+    elif update.message:
+        update.message.reply_text(text, reply_markup=markup, disable_web_page_preview=True)
 
 
 def persistent_keyboard():
@@ -90,20 +182,13 @@ def callback_token(action: str, target: str = "") -> str:
 def resolve_callback_token(data: str):
     token = data.split(":", 1)[1]
     item = CALLBACK_ACTIONS.pop(token, None)
-    if not item or time.time() - item["created"] > 600:
+    if not item or time.time() - item["created"] > CALLBACK_TOKEN_TTL:
         raise ValueError("按钮已过期，请重新打开菜单。")
     return item["action"], item["target"]
 
 
-def send_block(update: Update, title: str, body: str):
-    body = body or "(无输出)"
-    chunks = [body[i : i + MESSAGE_LIMIT] for i in range(0, len(body), MESSAGE_LIMIT)]
-    for index, chunk in enumerate(chunks):
-        suffix = f" ({index + 1}/{len(chunks)})" if len(chunks) > 1 else ""
-        reply(update, f"{title}{suffix}\n{chunk}")
-
-
 def run_cmd(cmd, cwd=None, timeout=COMMAND_TIMEOUT):
+    logger.debug(f"执行命令: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
     result = subprocess.run(
         cmd,
         cwd=cwd,
@@ -114,6 +199,7 @@ def run_cmd(cmd, cwd=None, timeout=COMMAND_TIMEOUT):
     )
     output = (result.stdout or "") + (result.stderr or "")
     if result.returncode != 0:
+        logger.warning(f"命令失败 (exit={result.returncode}): {' '.join(cmd) if isinstance(cmd, list) else cmd}")
         raise RuntimeError(output.strip() or f"命令失败，退出码：{result.returncode}")
     return output.strip()
 
@@ -155,7 +241,7 @@ def require_arg(context: CallbackContext, usage: str):
 
 
 def get_container_rows(all_containers=True):
-    containers = client.containers.list(all=all_containers)
+    containers = get_docker_client().containers.list(all=all_containers)
     rows = []
     for c in containers:
         image = c.image.tags[0] if c.image.tags else c.image.short_id
@@ -191,6 +277,7 @@ def main_menu():
 def services_menu():
     services = list_compose_services()
     rows = []
+    total = len(services)
     for service in services[:20]:
         rows.append(
             [
@@ -201,14 +288,17 @@ def services_menu():
                 InlineKeyboardButton("更新", callback_data=callback_token("confirm:svc_update", service)),
             ]
         )
-    rows.append([InlineKeyboardButton("全部更新", callback_data="confirm:svc_update_all:-")])
+    if total > 20:
+        rows.append([InlineKeyboardButton(f"⚠️ 仅显示前 20 个服务（共 {total} 个）", callback_data="noop")])
+    rows.append([InlineKeyboardButton("全部更新", callback_data=callback_token("confirm:svc_update_all", "-"))])
     rows.append([InlineKeyboardButton("返回", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
 
 def container_menu():
     rows = []
-    containers = client.containers.list(all=True)
+    containers = get_docker_client().containers.list(all=True)
+    total = len(containers)
     for c in containers[:20]:
         rows.append(
             [
@@ -219,6 +309,8 @@ def container_menu():
                 InlineKeyboardButton("更新", callback_data=callback_token("confirm:ctr_update", c.name)),
             ]
         )
+    if total > 20:
+        rows.append([InlineKeyboardButton(f"⚠️ 仅显示前 20 个容器（共 {total} 个）", callback_data="noop")])
     rows.append([InlineKeyboardButton("刷新容器列表", callback_data="menu:containers")])
     rows.append([InlineKeyboardButton("返回", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
@@ -263,16 +355,55 @@ def server_menu():
     )
 
 
+# ─── 分级清理菜单 (#8) ───────────────────────────────────────
 def cleanup_menu():
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("Docker 综合清理", callback_data="confirm:docker_prune:-")],
+            [InlineKeyboardButton("🟢 安全清理（悬空镜像+停止容器）", callback_data=callback_token("confirm:cleanup_safe", "-"))],
+            [InlineKeyboardButton("🟡 标准清理（+未使用镜像）", callback_data=callback_token("confirm:cleanup_standard", "-"))],
+            [InlineKeyboardButton("🔴 深度清理（+未使用卷+构建缓存）", callback_data=callback_token("confirm:cleanup_deep", "-"))],
             [InlineKeyboardButton("清理未使用卷", callback_data="confirm:volume_prune:-")],
-            [InlineKeyboardButton("清理未使用镜像", callback_data="confirm:image_prune:-")],
             [InlineKeyboardButton("清理未使用网络", callback_data="confirm:network_prune:-")],
+            [InlineKeyboardButton("📊 查看可清理空间", callback_data="menu:cleanup_preview")],
             [InlineKeyboardButton("返回", callback_data="menu:main")],
         ]
     )
+
+
+def cleanup_preview_text():
+    """获取可清理资源预览 (#8)。"""
+    try:
+        df = get_docker_client().df()
+        dangling_size = sum(i.get("Size", 0) for i in df.get("Images", []) if not i.get("Containers"))
+        unused_images = [i for i in df.get("Images", []) if not i.get("Containers")]
+        unused_image_size = sum(i.get("Size", 0) for i in unused_images)
+        stopped = [c for c in df.get("Containers", []) if c.get("State") != "running"]
+        stopped_size = sum(c.get("SizeRootFs", 0) for c in stopped)
+        unused_volumes = [v for v in df.get("Volumes", []) if not v.get("Containers") or v.get("Containers") == 0]
+        build_cache_size = sum(b.get("Size", 0) for b in df.get("BuildCache", []))
+
+        def fmt_size(n):
+            for unit in ("B", "KB", "MB", "GB", "TB"):
+                if n < 1024:
+                    return f"{n:.1f} {unit}"
+                n /= 1024
+
+        lines = [
+            "🧹 Docker 清理预览",
+            "",
+            f"悬空/未使用镜像：{len(unused_images)} 个，{fmt_size(unused_image_size)}",
+            f"停止的容器：{len(stopped)} 个，{fmt_size(stopped_size)}",
+            f"未使用卷：{len(unused_volumes)} 个",
+            f"构建缓存：{fmt_size(build_cache_size)}",
+            "",
+            "选择清理级别：",
+            "🟢 安全：悬空镜像 + 停止容器 + 未使用网络",
+            f"🟡 标准：+ 所有未使用镜像（共 {fmt_size(unused_image_size)}）",
+            "🔴 深度：+ 未使用卷 + 构建缓存",
+        ]
+        return "\n".join(lines)
+    except Exception as e:
+        return f"获取清理预览失败：{e}"
 
 
 def list_compose_services():
@@ -280,7 +411,7 @@ def list_compose_services():
         output = run_compose("config", "--services")
         return [line.strip() for line in output.splitlines() if line.strip()]
     except Exception:
-        containers = client.containers.list(all=True)
+        containers = get_docker_client().containers.list(all=True)
         services = sorted(
             {
                 c.labels.get("com.docker.compose.service")
@@ -389,6 +520,8 @@ def callback_router(update: Update, context: CallbackContext):
     token_target = None
     if data.startswith("cb:"):
         token_action, token_target = resolve_callback_token(data)
+    if data == "noop":
+        return
     if data == "cancel":
         edit_or_reply(update, "已取消。", main_menu())
         return
@@ -441,6 +574,9 @@ def callback_router(update: Update, context: CallbackContext):
     if data == "menu:cleanup":
         edit_or_reply(update, "清理操作需要二次确认：", cleanup_menu())
         return
+    if data == "menu:cleanup_preview":
+        edit_or_reply(update, cleanup_preview_text(), cleanup_menu())
+        return
     if token_action == "svc_view":
         service = token_target
         output = run_compose("ps", service)
@@ -448,7 +584,7 @@ def callback_router(update: Update, context: CallbackContext):
         return
     if token_action == "ctr_view":
         name = token_target
-        c = client.containers.get(name)
+        c = get_docker_client().containers.get(name)
         body = "\n".join(
             [
                 f"名称：{c.name}",
@@ -460,12 +596,23 @@ def callback_router(update: Update, context: CallbackContext):
         )
         send_block(update, f"容器详情 {name}", body)
         return
-    if data.startswith("confirm:") or (token_action and token_action.startswith("confirm:")):
-        if token_action:
-            action = token_action.split(":", 1)[1]
-            target = token_target
-        else:
-            _, action, target = data.split(":", 2)
+    # ─── 确认操作处理 ────────────────────────────────────────
+    confirm_action = None
+    confirm_target = None
+    if token_action and token_action.startswith("confirm:"):
+        confirm_action = token_action.split(":", 1)[1]
+        confirm_target = token_target
+    elif data.startswith("confirm:"):
+        parts = data.split(":", 2)
+        if len(parts) >= 3:
+            _, confirm_action, confirm_target = parts
+        elif len(parts) == 2:
+            _, confirm_action = parts
+            confirm_target = "-"
+
+    if confirm_action or data.startswith("confirm:"):
+        action = confirm_action
+        target = confirm_target if confirm_target else "-"
         labels = {
             "svc_start": "启动",
             "svc_stop": "停止",
@@ -480,13 +627,16 @@ def callback_router(update: Update, context: CallbackContext):
             "volume_prune": "清理未使用卷",
             "image_prune": "清理未使用镜像",
             "network_prune": "清理未使用网络",
+            "cleanup_safe": "安全清理",
+            "cleanup_standard": "标准清理",
+            "cleanup_deep": "深度清理",
         }
         edit_or_reply(update, f"确认执行：{labels.get(action, action)} {target if target != '-' else ''}", confirmation_keyboard(action, target, labels.get(action, action)))
         return
     if data.startswith("do:"):
         token = data.split(":", 1)[1]
         pending = PENDING_ACTIONS.pop(token, None)
-        if not pending or time.time() - pending["created"] > 300:
+        if not pending or time.time() - pending["created"] > PENDING_TOKEN_TTL:
             edit_or_reply(update, "确认已过期，请重新发起操作。", main_menu())
             return
         execute_confirmed_action(update, pending["action"], pending["target"])
@@ -514,8 +664,14 @@ def text_menu_router(update: Update, context: CallbackContext):
         help_command(update, context)
 
 
+# ─── 操作执行：带并发锁 (#9) + 日志 (#5) ─────────────────────
 def execute_confirmed_action(update: Update, action: str, target: str):
+    # 尝试获取锁，防止并发冲突操作
+    if not _operation_lock.acquire(blocking=False):
+        reply(update, "⚠️ 有其他操作正在执行中，请等待完成后再试。", main_menu())
+        return
     try:
+        logger.info(f"执行操作: action={action}, target={target}")
         if action == "svc_start":
             output = run_compose("start", target)
         elif action == "svc_stop":
@@ -535,11 +691,19 @@ def execute_confirmed_action(update: Update, action: str, target: str):
         elif action == "ctr_update":
             output = update_container_by_name(target)
         elif action == "docker_prune":
+            # ─── 改为标准清理而非最激进 (#8) ──────────────────
+            output = run_cmd(["docker", "system", "prune", "-f"])
+        elif action == "cleanup_safe":
+            output = run_cmd(["docker", "system", "prune", "-f"])
+        elif action == "cleanup_standard":
             output = run_cmd(["docker", "system", "prune", "-af"])
+        elif action == "cleanup_deep":
+            output = run_cmd(["docker", "system", "prune", "-af", "--volumes"])
         elif action == "volume_prune":
             output = run_cmd(["docker", "volume", "prune", "-f"])
         elif action == "image_prune":
-            output = run_cmd(["docker", "image", "prune", "-af"])
+            # ─── image prune 默认只清理悬空镜像 (#8) ──────────
+            output = run_cmd(["docker", "image", "prune", "-f"])
         elif action == "service_remove":
             output = run_compose("rm", "-sf", target)
         elif action == "container_remove":
@@ -554,13 +718,17 @@ def execute_confirmed_action(update: Update, action: str, target: str):
             output = run_cmd(shlex.split(target))
         else:
             output = f"未知操作：{action}"
+        logger.info(f"操作完成: action={action}, target={target}")
         send_block(update, "执行完成", output)
     except Exception as e:
+        logger.error(f"操作失败: action={action}, target={target}: {e}", exc_info=True)
         reply(update, f"执行失败：{e}")
+    finally:
+        _operation_lock.release()
 
 
 def update_container_by_name(name: str) -> str:
-    container = client.containers.get(name)
+    container = get_docker_client().containers.get(name)
     compose_service = container.labels.get("com.docker.compose.service")
     compose_project = container.labels.get("com.docker.compose.project")
     image = container.image.tags[0] if container.image.tags else container.image.short_id
@@ -600,8 +768,8 @@ def list_containers(update: Update, context: CallbackContext):
 
 @restricted
 def docker_info(update: Update, context: CallbackContext):
-    version = client.version()
-    info = client.info()
+    version = get_docker_client().version()
+    info = get_docker_client().info()
     body = "\n".join(
         [
             f"Docker 版本：{version.get('Version', '未知')}",
@@ -618,7 +786,7 @@ def docker_info(update: Update, context: CallbackContext):
 @restricted
 def docker_images(update: Update, context: CallbackContext):
     rows = []
-    for image in client.images.list():
+    for image in get_docker_client().images.list():
         tags = ", ".join(image.tags) if image.tags else "<none>"
         size = image.attrs.get("Size", 0) / 1024 / 1024
         rows.append(f"{image.short_id:18} {size:10.1f} MB  {tags}")
@@ -627,7 +795,7 @@ def docker_images(update: Update, context: CallbackContext):
 
 @restricted
 def list_volumes(update: Update, context: CallbackContext):
-    volumes = client.volumes.list()
+    volumes = get_docker_client().volumes.list()
     rows = []
     for volume in volumes:
         rows.append(f"{volume.name:36} {volume.attrs.get('Driver', '-')}")
@@ -636,7 +804,7 @@ def list_volumes(update: Update, context: CallbackContext):
 
 @restricted
 def list_networks(update: Update, context: CallbackContext):
-    networks = client.networks.list()
+    networks = get_docker_client().networks.list()
     rows = [f"{n.short_id:12} {n.name:28} {n.attrs.get('Driver', '-')}" for n in networks]
     send_block(update, "Docker 网络", "\n".join(rows) or "暂无网络")
 
@@ -731,7 +899,7 @@ def container_update(update: Update, context: CallbackContext):
 @restricted
 def container_inspect(update: Update, context: CallbackContext):
     name = require_arg(context, "/container_inspect <容器名>")
-    c = client.containers.get(name)
+    c = get_docker_client().containers.get(name)
     body = "\n".join(
         [
             f"名称：{c.name}",
@@ -746,23 +914,48 @@ def container_inspect(update: Update, context: CallbackContext):
     send_block(update, f"容器详情 {name}", body)
 
 
+# ─── 安全获取嵌套字典值 (#3) ─────────────────────────────────
+def _safe_get(data, *keys, default=0):
+    """安全获取嵌套字典值，避免 KeyError。"""
+    for key in keys:
+        if not isinstance(data, dict):
+            return default
+        data = data.get(key, default)
+    return data if data is not None else default
+
+
 @restricted
 def container_stats(update: Update, context: CallbackContext):
     name = require_arg(context, "/container_stats <容器名>")
-    c = client.containers.get(name)
+    c = get_docker_client().containers.get(name)
     stats = c.stats(stream=False)
-    cpu_delta = stats["cpu_stats"]["cpu_usage"]["total_usage"] - stats["precpu_stats"]["cpu_usage"]["total_usage"]
-    system_delta = stats["cpu_stats"].get("system_cpu_usage", 0) - stats["precpu_stats"].get("system_cpu_usage", 0)
-    cpu_count = stats["cpu_stats"].get("online_cpus") or len(stats["cpu_stats"]["cpu_usage"].get("percpu_usage", [])) or 1
+
+    # ─── 使用安全访问，防止 KeyError (#3) ──────────────────
+    cpu_usage = _safe_get(stats, "cpu_stats", "cpu_usage", "total_usage", default=0)
+    precpu_usage = _safe_get(stats, "precpu_stats", "cpu_usage", "total_usage", default=0)
+    cpu_delta = cpu_usage - precpu_usage
+
+    system_usage = _safe_get(stats, "cpu_stats", "system_cpu_usage", default=0)
+    pre_system = _safe_get(stats, "precpu_stats", "system_cpu_usage", default=0)
+    system_delta = system_usage - pre_system
+
+    cpu_count = (
+        _safe_get(stats, "cpu_stats", "online_cpus", default=0)
+        or len(_safe_get(stats, "cpu_stats", "cpu_usage", "percpu_usage", default=[]) or [])
+        or 1
+    )
     cpu = (cpu_delta / system_delta * cpu_count * 100) if system_delta > 0 else 0
-    mem_used = stats.get("memory_stats", {}).get("usage", 0)
-    mem_limit = stats.get("memory_stats", {}).get("limit", 1)
+
+    mem_stats = stats.get("memory_stats", {})
+    mem_used = mem_stats.get("usage", 0)
+    mem_limit = mem_stats.get("limit", 1)
+
     network_rx = sum(n.get("rx_bytes", 0) for n in stats.get("networks", {}).values())
     network_tx = sum(n.get("tx_bytes", 0) for n in stats.get("networks", {}).values())
     body = "\n".join(
         [
             f"CPU：{cpu:.2f}%",
-            f"内存：{mem_used / 1024 / 1024:.2f} MB / {mem_limit / 1024 / 1024:.2f} MB ({mem_used / mem_limit * 100:.2f}%)",
+            f"内存：{mem_used / 1024 / 1024:.2f} MB / {mem_limit / 1024 / 1024:.2f} MB ({mem_used / mem_limit * 100:.2f}%)" if mem_limit > 0 else f"内存：{mem_used / 1024 / 1024:.2f} MB",
             f"网络入站：{network_rx / 1024 / 1024:.2f} MB",
             f"网络出站：{network_tx / 1024 / 1024:.2f} MB",
         ]
@@ -801,7 +994,7 @@ def image_prune(update: Update, context: CallbackContext):
 @restricted
 def volume_inspect(update: Update, context: CallbackContext):
     volume = require_arg(context, "/volume_inspect <卷名>")
-    v = client.volumes.get(volume)
+    v = get_docker_client().volumes.get(volume)
     body = "\n".join([f"{key}: {value}" for key, value in v.attrs.items()])
     send_block(update, f"存储卷详情 {volume}", body)
 
@@ -890,6 +1083,8 @@ def bot_info(update: Update, context: CallbackContext):
             f"命令超时：{COMMAND_TIMEOUT}s",
             f"日志行数：{LOG_TAIL}",
             f"允许用户数：{len(ALLOWED_USER_IDS)}",
+            f"日志级别：{logging.getLevelName(logger.getEffectiveLevel())}",
+            f"待处理 token：callback={len(CALLBACK_ACTIONS)}, pending={len(PENDING_ACTIONS)}",
         ]
     )
     send_block(update, "机器人运行信息", body)
@@ -898,6 +1093,7 @@ def bot_info(update: Update, context: CallbackContext):
 @restricted
 def bot_restart(update: Update, context: CallbackContext):
     reply(update, "机器人即将退出。如果已配置 Docker restart: unless-stopped 或 systemd Restart=always，会自动拉起新进程。")
+    logger.info("收到 bot_restart 命令，发送 SIGTERM")
     os.kill(os.getpid(), signal.SIGTERM)
 
 
@@ -985,7 +1181,7 @@ def set_bot_commands(updater: Updater):
             ]
         )
     except TelegramError as e:
-        print(f"警告：设置 Telegram 命令菜单失败，机器人将继续启动：{e}", flush=True)
+        logger.warning(f"设置 Telegram 命令菜单失败，机器人将继续启动：{e}")
 
 
 def telegram_request_kwargs():
@@ -998,16 +1194,37 @@ def telegram_request_kwargs():
     return request_kwargs
 
 
+# ─── 健康检查心跳文件 (#7) ───────────────────────────────────
+HEALTH_FILE = "/tmp/bot_healthy"
+
+
+def heartbeat_loop():
+    """后台线程：定期更新心跳文件，供 Docker HEALTHCHECK 使用。"""
+    while True:
+        try:
+            with open(HEALTH_FILE, "w") as f:
+                f.write(str(time.time()))
+        except Exception:
+            pass
+        time.sleep(30)
+
+
 def main():
     if not TELEGRAM_TOKEN:
         raise RuntimeError("请在 .env 中配置 TELEGRAM_TOKEN")
     if not ALLOWED_USER_IDS:
         raise RuntimeError("请在 .env 中配置 ALLOWED_USER_ID 或 ALLOWED_USER_IDS")
 
+    # 启动后台线程：token 清理 (#2) + 心跳 (#7)
+    threading.Thread(target=cleanup_expired_tokens, daemon=True).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+
+    logger.info("Docker 管理机器人启动中...")
     updater = Updater(TELEGRAM_TOKEN, use_context=True, request_kwargs=telegram_request_kwargs())
     add_handlers(updater.dispatcher)
     set_bot_commands(updater)
     updater.start_polling()
+    logger.info("机器人已启动，开始接收消息")
     updater.idle()
 
 
