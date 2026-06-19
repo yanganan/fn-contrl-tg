@@ -30,6 +30,12 @@ services:
       CPU_THRESHOLD: "95"
       ALERT_COOLDOWN: "1800"
 
+      # Phase 3: 更新检查 + 历史
+      ENABLE_UPDATE_CHECKER: "true"
+      UPDATE_CHECK_INTERVAL: "6"
+      UPDATE_IGNORE: "watchtower,cadvisor"
+      HISTORY_DB: "/data/bot_history.db"
+
       # 可选：飞牛无法直连 Telegram 时配置代理。
       # 常见 HTTP 代理示例：http://192.168.1.2:7890
       # 常见 SOCKS5 代理示例：socks5://192.168.1.2:7891
@@ -39,4 +45,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /vol1/1000/docker-services:/vol1/1000/docker-services
+      - bot-data:/data
     working_dir: /app
+
+volumes:
+  bot-data:

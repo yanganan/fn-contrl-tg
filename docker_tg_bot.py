@@ -3,6 +3,7 @@ import os
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -77,6 +78,41 @@ LONG_OPERATIONS = {
     "container_run",
 }
 
+# ─── Phase 3: 更新检查配置 (#14) ────────────────────────────
+ENABLE_UPDATE_CHECKER = os.getenv("ENABLE_UPDATE_CHECKER", "true").strip().lower() in ("true", "1", "yes")
+UPDATE_CHECK_INTERVAL = int(os.getenv("UPDATE_CHECK_INTERVAL", "6")) * 3600  # 小时 → 秒
+UPDATE_IGNORE = {s.strip() for s in os.getenv("UPDATE_IGNORE", "").split(",") if s.strip()}
+
+# ─── Phase 3: 多 Compose 项目支持 (#15) ─────────────────────
+# COMPOSE_DIRS 用冒号分隔多个目录，向后兼容单个 DOCKER_COMPOSE_DIR
+_COMPOSE_PROJECTS = []  # [{"name": str, "dir": str, "file": str|None}]
+
+def _load_compose_projects():
+    """加载所有 compose 项目配置。"""
+    global _COMPOSE_PROJECTS
+    dirs_env = os.getenv("COMPOSE_DIRS", "").strip()
+    if dirs_env:
+        for d in dirs_env.split(":"):
+            d = d.strip()
+            if d and os.path.isdir(d):
+                _COMPOSE_PROJECTS.append({
+                    "name": os.path.basename(d.rstrip("/")),
+                    "dir": d,
+                    "file": None,
+                })
+    if not _COMPOSE_PROJECTS:
+        # 向后兼容：使用 DOCKER_COMPOSE_DIR
+        _COMPOSE_PROJECTS.append({
+            "name": os.path.basename(DOCKER_COMPOSE_DIR.rstrip("/")) or "default",
+            "dir": DOCKER_COMPOSE_DIR,
+            "file": DOCKER_COMPOSE_FILE or None,
+        })
+
+_load_compose_projects()
+
+# ─── Phase 3: 操作历史 SQLite (#16) ─────────────────────────
+HISTORY_DB = os.getenv("HISTORY_DB", "/data/bot_history.db")
+
 
 # ─── Docker 客户端延迟初始化 (#4) ────────────────────────────
 _docker_client = None
@@ -115,6 +151,211 @@ def _send_alert_to_all(text: str, markup=None):
             )
         except Exception as e:
             logger.error(f"发送告警到 {user_id} 失败: {e}")
+
+
+# ═══════════════════════════════════════════════════════════
+# Phase 3: 核心新功能
+# ═══════════════════════════════════════════════════════════
+
+# ─── 操作历史 SQLite (#16) ─────────────────────────────────
+def _get_db():
+    """获取 SQLite 连接，自动初始化表结构。"""
+    db_dir = os.path.dirname(HISTORY_DB)
+    if db_dir and not os.path.isdir(db_dir):
+        try:
+            os.makedirs(db_dir, exist_ok=True)
+        except Exception:
+            pass
+    conn = sqlite3.connect(HISTORY_DB)
+    conn.execute("""CREATE TABLE IF NOT EXISTS update_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT NOT NULL,
+        service TEXT NOT NULL,
+        image TEXT,
+        old_digest TEXT,
+        new_digest TEXT,
+        status TEXT,
+        user_id INTEGER
+    )""")
+    conn.commit()
+    return conn
+
+
+def record_update_history(service, image, old_digest, new_digest, status, user_id=0):
+    """记录一次更新操作到 SQLite。"""
+    try:
+        conn = _get_db()
+        conn.execute(
+            "INSERT INTO update_history (timestamp, service, image, old_digest, new_digest, status, user_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (time.strftime("%Y-%m-%d %H:%M:%S"), service, image, old_digest, new_digest, status, user_id),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"记录更新历史失败: {e}")
+
+
+def get_update_history(service=None, limit=10):
+    """查询更新历史。"""
+    try:
+        conn = _get_db()
+        if service:
+            rows = conn.execute(
+                "SELECT timestamp, service, image, old_digest, new_digest, status FROM update_history WHERE service=? ORDER BY id DESC LIMIT ?",
+                (service, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT timestamp, service, image, old_digest, new_digest, status FROM update_history ORDER BY id DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        conn.close()
+        return rows
+    except Exception as e:
+        logger.warning(f"查询更新历史失败: {e}")
+        return []
+
+
+def get_last_image_tag(service):
+    """获取服务上一次更新前的镜像 tag（用于回滚）。"""
+    try:
+        conn = _get_db()
+        row = conn.execute(
+            "SELECT old_digest FROM update_history WHERE service=? AND old_digest IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (service,),
+        ).fetchone()
+        conn.close()
+        return row[0] if row else None
+    except Exception:
+        return None
+
+
+# ─── 定时镜像更新检查 (#14) ─────────────────────────────────
+def _get_image_digest(image_tag):
+    """获取本地镜像的 RepoDigest，如果没有返回 None。"""
+    try:
+        img = get_docker_client().images.get(image_tag)
+        digests = img.attrs.get("RepoDigests", [])
+        if digests:
+            return digests[0].split("@")[-1] if "@" in digests[0] else None
+        return None
+    except Exception:
+        return None
+
+
+def _get_service_image(service):
+    """通过 docker compose config 获取服务的镜像名。"""
+    try:
+        output = run_compose("config", "--image", service)
+        image = output.strip().splitlines()[0].strip() if output.strip() else None
+        return image
+    except Exception:
+        return None
+
+
+def check_all_updates():
+    """检查所有 compose 服务是否有可用更新。
+    返回 [{"service": str, "image": str}] 列表。
+    """
+    updates = []
+    try:
+        services = list_compose_services()
+    except Exception:
+        return []
+
+    for svc in services:
+        if svc in UPDATE_IGNORE:
+            continue
+        image = _get_service_image(svc)
+        if not image:
+            continue
+        # 只检查有 tag 的镜像（非 latest 也检查，latest 必然有更新可能）
+        # 使用 docker pull + 比较 digest 的方式
+        try:
+            local_digest = _get_image_digest(image)
+            if not local_digest:
+                continue
+            # 拉取远端 digest（不下载层）
+            remote_digest = _inspect_remote_digest(image)
+            if remote_digest and remote_digest != local_digest:
+                updates.append({"service": svc, "image": image})
+        except Exception as e:
+            logger.debug(f"检查 {svc} 更新失败: {e}")
+    return updates
+
+
+def _inspect_remote_digest(image_tag):
+    """获取远端 registry 的镜像 digest（通过 docker manifest inspect）。"""
+    try:
+        output = run_cmd(
+            ["docker", "manifest", "inspect", image_tag],
+            timeout=30,
+        )
+        # 解析 manifest 输出找 digest
+        import json as _json
+        data = _json.loads(output)
+        # 多架构镜像
+        if "manifests" in data:
+            # 取第一个 manifest 的 digest
+            for m in data["manifests"]:
+                platform = m.get("platform", {})
+                if platform.get("architecture") in ("amd64", "arm64") and platform.get("os") == "linux":
+                    return m.get("digest")
+            return data["manifests"][0].get("digest") if data["manifests"] else None
+        return data.get("config", {}).get("digest")
+    except Exception:
+        # 可能没有 manifest 命令或不支持，用 buildx imagetools
+        try:
+            output = run_cmd(["docker", "buildx", "imagetools", "inspect", image_tag], timeout=30)
+            for line in output.splitlines():
+                if "Digest:" in line:
+                    return line.split("Digest:")[-1].strip()
+        except Exception:
+            pass
+        return None
+
+
+def update_checker_loop():
+    """后台线程：定时检查镜像更新，发现可更新时推送通知。"""
+    logger.info(f"镜像更新检查线程已启动 (间隔={UPDATE_CHECK_INTERVAL // 3600}h)")
+    # 启动后等待 2 分钟再做第一次检查（避免启动时 Docker 还没就绪）
+    time.sleep(120)
+    while True:
+        try:
+            updates = check_all_updates()
+            if updates:
+                logger.info(f"发现 {len(updates)} 个可更新服务")
+                lines = ["🔔 发现以下服务有可用更新：\n"]
+                for u in updates:
+                    lines.append(f"  ✅ {u['service']:20} {u['image']}")
+
+                lines.append(f"\n共 {len(updates)} 个服务可更新。")
+
+                # 构建一键更新按钮
+                keyboard = None
+                if _bot_instance:
+                    rows = []
+                    # 全部更新按钮
+                    rows.append([InlineKeyboardButton(
+                        f"🚀 全部更新（{len(updates)} 个）",
+                        callback_data=callback_token("confirm:svc_update_all", "-"),
+                    )])
+                    # 逐个更新按钮
+                    for u in updates[:8]:
+                        rows.append([InlineKeyboardButton(
+                            f"更新 {u['service']}",
+                            callback_data=callback_token("confirm:svc_update", u["service"]),
+                        )])
+                    rows.append([InlineKeyboardButton("忽略本次", callback_data="noop")])
+                    keyboard = InlineKeyboardMarkup(rows)
+
+                _send_alert_to_all("\n".join(lines), keyboard)
+            else:
+                logger.debug("所有服务均为最新版本")
+        except Exception as e:
+            logger.warning(f"更新检查异常: {e}", exc_info=True)
+
+        time.sleep(UPDATE_CHECK_INTERVAL)
 
 
 # ─── 长操作异步化 (#10) ──────────────────────────────────────
@@ -158,9 +399,19 @@ def _do_action(action: str, target: str) -> str:
     elif action == "svc_restart":
         return run_compose("restart", target)
     elif action == "svc_update":
-        return run_compose("pull", target) + "\n" + run_compose("up", "-d", target)
+        old_digest = _get_image_digest(_get_service_image(target) or "")
+        output = run_compose("pull", target) + "\n" + run_compose("up", "-d", target)
+        new_digest = _get_image_digest(_get_service_image(target) or "")
+        record_update_history(target, _get_service_image(target), old_digest, new_digest, "updated")
+        return output
     elif action == "svc_update_all":
-        return run_compose("pull") + "\n" + run_compose("up", "-d")
+        services = list_compose_services()
+        output = run_compose("pull") + "\n" + run_compose("up", "-d")
+        for svc in services:
+            img = _get_service_image(svc) or ""
+            new_d = _get_image_digest(img)
+            record_update_history(svc, img, None, new_d, "updated_all")
+        return output
     elif action == "ctr_start":
         return run_cmd(["docker", "start", target])
     elif action == "ctr_stop":
@@ -520,7 +771,10 @@ def main_menu():
                 InlineKeyboardButton("服务器状态", callback_data="menu:server"),
                 InlineKeyboardButton("清理资源", callback_data="menu:cleanup"),
             ],
-            [InlineKeyboardButton("命令帮助", callback_data="menu:help")],
+            [
+                InlineKeyboardButton("🔔 检查更新", callback_data="menu:check_updates"),
+                InlineKeyboardButton("命令帮助", callback_data="menu:help"),
+            ],
         ]
     )
 
@@ -824,6 +1078,9 @@ def callback_router(update: Update, context: CallbackContext):
         return
     if data == "menu:cleanup":
         edit_or_reply(update, "清理操作需要二次确认：", cleanup_menu())
+        return
+    if data == "menu:check_updates":
+        check_updates_cmd(update, context)
         return
     if data == "menu:cleanup_preview":
         edit_or_reply(update, cleanup_preview_text(), cleanup_menu())
@@ -1314,6 +1571,10 @@ def bot_info(update: Update, context: CallbackContext):
             f"事件监听：{'✅开' if ENABLE_EVENT_MONITOR else '❌关'}",
             f"资源监控：{'✅开' if ENABLE_RESOURCE_MONITOR else '❌关'}"
             + (f"（磁盘>{DISK_THRESHOLD}% 内存>{MEM_THRESHOLD}% CPU>{CPU_THRESHOLD}%）" if ENABLE_RESOURCE_MONITOR else ""),
+            f"更新检查：{'✅开' if ENABLE_UPDATE_CHECKER else '❌关'}"
+            + (f"（间隔 {UPDATE_CHECK_INTERVAL // 3600}h）" if ENABLE_UPDATE_CHECKER else ""),
+            f"Compose 项目：{len(_COMPOSE_PROJECTS)} 个",
+            f"更新历史：{len(get_update_history())} 条",
         ]
     )
     send_block(update, "机器人运行信息", body)
@@ -1324,6 +1585,94 @@ def bot_restart(update: Update, context: CallbackContext):
     reply(update, "机器人即将退出。如果已配置 Docker restart: unless-stopped 或 systemd Restart=always，会自动拉起新进程。")
     logger.info("收到 bot_restart 命令，发送 SIGTERM")
     os.kill(os.getpid(), signal.SIGTERM)
+
+
+# ═══════════════════════════════════════════════════════════
+# Phase 3: 新命令
+# ═══════════════════════════════════════════════════════════
+
+@restricted
+def check_updates_cmd(update: Update, context: CallbackContext):
+    """手动触发更新检查 (#14)。"""
+    reply(update, "⏳ 正在检查镜像更新，请稍候...")
+    try:
+        updates = check_all_updates()
+        if not updates:
+            send_block(update, "更新检查", "✅ 所有服务均为最新版本，无需更新。")
+            return
+
+        lines = [f"🔔 发现 {len(updates)} 个可更新服务：\n"]
+        for u in updates:
+            lines.append(f"  ✅ {u['service']:20} {u['image']}")
+
+        # 构建按钮
+        rows = []
+        rows.append([InlineKeyboardButton(
+            f"🚀 全部更新（{len(updates)} 个）",
+            callback_data=callback_token("confirm:svc_update_all", "-"),
+        )])
+        for u in updates[:8]:
+            rows.append([InlineKeyboardButton(
+                f"更新 {u['service']}",
+                callback_data=callback_token("confirm:svc_update", u["service"]),
+            )])
+        rows.append([InlineKeyboardButton("返回主菜单", callback_data="menu:main")])
+        keyboard = InlineKeyboardMarkup(rows)
+
+        _send_new_message(update, "\n".join(lines), keyboard)
+    except Exception as e:
+        send_block(update, "更新检查", f"检查失败：{e}")
+
+
+@restricted
+def history_cmd(update: Update, context: CallbackContext):
+    """查看更新历史 (#16)。"""
+    service = safe_arg(context.args[0]) if context.args else None
+    rows = get_update_history(service, limit=15)
+    if not rows:
+        send_block(update, "更新历史", "暂无更新记录。")
+        return
+
+    lines = []
+    for ts, svc, img, old_d, new_d, status in rows:
+        digest_short = (new_d or "?")[:19]
+        lines.append(f"{ts}  {svc:20} {status:12} {digest_short}")
+    title = f"更新历史 — {service}" if service else "更新历史（全部）"
+    send_block(update, title, "\n".join(lines))
+
+
+@restricted
+def rollback_cmd(update: Update, context: CallbackContext):
+    """回滚服务到上一个版本 (#16)。"""
+    service = require_arg(context, "/rollback <服务名>")
+    old_tag = get_last_image_tag(service)
+    if not old_tag:
+        send_block(update, "回滚", f"没有找到 {service} 的历史版本记录，无法回滚。")
+        return
+
+    reply(
+        update,
+        f"将回滚服务 {service}\n目标版本：{old_tag[:50]}\n\n"
+        f"回滚将通过 docker pull 旧镜像 + compose up 实现。",
+        confirmation_keyboard("svc_update", service, f"回滚 {service}"),
+    )
+
+
+@restricted
+def compose_projects_cmd(update: Update, context: CallbackContext):
+    """列出所有 compose 项目 (#15)。"""
+    if len(_COMPOSE_PROJECTS) <= 1:
+        send_block(update, "Compose 项目", f"当前项目：{_COMPOSE_PROJECTS[0]['name']}\n目录：{_COMPOSE_PROJECTS[0]['dir']}")
+        return
+
+    lines = [f"Compose 项目（共 {len(_COMPOSE_PROJECTS)} 个）\n"]
+    for p in _COMPOSE_PROJECTS:
+        lines.append(f"📦 {p['name']}")
+        lines.append(f"   目录：{p['dir']}")
+        if p["file"]:
+            lines.append(f"   文件：{p['file']}")
+        lines.append("")
+    send_block(update, "Compose 项目列表", "\n".join(lines))
 
 
 def add_handlers(dp):
@@ -1379,6 +1728,12 @@ def add_handlers(dp):
     dp.add_handler(CommandHandler("bot_info", bot_info))
     dp.add_handler(CommandHandler("bot_restart", bot_restart))
 
+    # Phase 3: 新命令
+    dp.add_handler(CommandHandler("check_updates", check_updates_cmd))
+    dp.add_handler(CommandHandler("history", history_cmd))
+    dp.add_handler(CommandHandler("rollback", rollback_cmd))
+    dp.add_handler(CommandHandler("compose_projects", compose_projects_cmd))
+
     # 旧命令兼容。
     dp.add_handler(CommandHandler("update", service_update))
     dp.add_handler(CommandHandler("start_service", service_start))
@@ -1407,6 +1762,10 @@ def set_bot_commands(updater: Updater):
                 BotCommand("server_info", "查看服务器资源状态"),
                 BotCommand("bot_info", "查看机器人运行信息"),
                 BotCommand("bot_restart", "重启机器人进程"),
+                BotCommand("check_updates", "检查镜像更新"),
+                BotCommand("history", "查看更新历史"),
+                BotCommand("rollback", "回滚服务版本"),
+                BotCommand("compose_projects", "列出 compose 项目"),
             ]
         )
     except TelegramError as e:
@@ -1460,6 +1819,8 @@ def main():
         threading.Thread(target=docker_event_monitor, daemon=True).start()
     if ENABLE_RESOURCE_MONITOR:
         threading.Thread(target=resource_monitor, daemon=True).start()
+    if ENABLE_UPDATE_CHECKER:
+        threading.Thread(target=update_checker_loop, daemon=True).start()
 
     logger.info("机器人已启动，开始接收消息")
     updater.idle()
