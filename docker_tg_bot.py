@@ -113,6 +113,21 @@ _load_compose_projects()
 # ─── Phase 3: 操作历史 SQLite (#16) ─────────────────────────
 HISTORY_DB = os.getenv("HISTORY_DB", "/data/bot_history.db")
 
+# ─── Phase 4: 高级功能配置 ──────────────────────────────────
+ADMIN_USER_IDS = {
+    int(uid.strip())
+    for uid in os.getenv("ADMIN_USER_IDS", os.getenv("ALLOWED_USER_IDS", os.getenv("ALLOWED_USER_ID", ""))).split(",")
+    if uid.strip()
+}
+READONLY_USER_IDS = {
+    int(uid.strip())
+    for uid in os.getenv("READONLY_USER_IDS", "").split(",")
+    if uid.strip()
+}
+EXEC_FORBIDDEN = {"rm -rf", "shutdown", "reboot", "mkfs", "dd if=", ":(){:|:&};:"}
+EXEC_TIMEOUT = int(os.getenv("EXEC_TIMEOUT", "30"))
+LOG_STREAM_DURATION = int(os.getenv("LOG_STREAM_DURATION", "30"))
+
 
 # ─── Docker 客户端延迟初始化 (#4) ────────────────────────────
 _docker_client = None
@@ -444,6 +459,8 @@ def _do_action(action: str, target: str) -> str:
         return run_cmd(["docker", "network", "prune", "-f"])
     elif action == "container_run":
         return run_cmd(shlex.split(target))
+    elif action in ("batch_start", "batch_stop", "batch_restart"):
+        return _do_batch_action(action, target)
     else:
         return f"未知操作：{action}"
 
@@ -769,12 +786,13 @@ def main_menu():
             ],
             [
                 InlineKeyboardButton("服务器状态", callback_data="menu:server"),
-                InlineKeyboardButton("清理资源", callback_data="menu:cleanup"),
+                InlineKeyboardButton("📊 统计", callback_data="menu:stats"),
             ],
             [
                 InlineKeyboardButton("🔔 检查更新", callback_data="menu:check_updates"),
-                InlineKeyboardButton("命令帮助", callback_data="menu:help"),
+                InlineKeyboardButton("🧹 清理资源", callback_data="menu:cleanup"),
             ],
+            [InlineKeyboardButton("命令帮助", callback_data="menu:help")],
         ]
     )
 
@@ -1082,6 +1100,9 @@ def callback_router(update: Update, context: CallbackContext):
     if data == "menu:check_updates":
         check_updates_cmd(update, context)
         return
+    if data == "menu:stats":
+        stats_cmd(update, context)
+        return
     if data == "menu:cleanup_preview":
         edit_or_reply(update, cleanup_preview_text(), cleanup_menu())
         return
@@ -1138,6 +1159,9 @@ def callback_router(update: Update, context: CallbackContext):
             "cleanup_safe": "安全清理",
             "cleanup_standard": "标准清理",
             "cleanup_deep": "深度清理",
+            "batch_start": "批量启动",
+            "batch_stop": "批量停止",
+            "batch_restart": "批量重启",
         }
         edit_or_reply(update, f"确认执行：{labels.get(action, action)} {target if target != '-' else ''}", confirmation_keyboard(action, target, labels.get(action, action)))
         return
@@ -1675,6 +1699,392 @@ def compose_projects_cmd(update: Update, context: CallbackContext):
     send_block(update, "Compose 项目列表", "\n".join(lines))
 
 
+# ═══════════════════════════════════════════════════════════
+# Phase 4: 高级功能
+# ═══════════════════════════════════════════════════════════
+
+# ─── #18 容器 exec + 实时日志流 ─────────────────────────────
+@restricted
+def container_exec_cmd(update: Update, context: CallbackContext):
+    """在容器内执行命令。"""
+    if len(context.args) < 2:
+        raise ValueError("用法：/container_exec <容器名> <命令>")
+    name = safe_arg(context.args[0])
+    command = " ".join(context.args[1:])
+
+    # 安全检查：禁止危险命令
+    cmd_lower = command.lower()
+    for forbidden in EXEC_FORBIDDEN:
+        if forbidden in cmd_lower:
+            raise ValueError(f"命令包含被禁止的操作：{forbidden}")
+
+    reply(update, f"⏳ 在容器 {name} 中执行：{command}")
+    try:
+        container = get_docker_client().containers.get(name)
+        exit_code, output = container.exec_run(
+            cmd=shlex.split(command),
+            workdir="/",
+        )
+        result = output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+        if exit_code != 0:
+            result = f"退出码：{exit_code}\n\n{result}"
+        send_block(update, f"exec {name}", result)
+    except Exception as e:
+        send_block(update, f"exec {name}", f"执行失败：{e}")
+
+
+@restricted
+def container_logs_cmd(update: Update, context: CallbackContext):
+    """查看非 compose 容器日志。"""
+    name = require_arg(context, "/container_logs <容器名> [行数]")
+    tail = safe_arg(context.args[1]) if len(context.args) > 1 else str(LOG_TAIL)
+    container = get_docker_client().containers.get(name)
+    logs = container.logs(tail=int(tail)).decode("utf-8", errors="replace")
+    send_block(update, f"{name} 日志（最后 {tail} 行）", logs or "(无日志)")
+
+
+@restricted
+def container_logstream_cmd(update: Update, context: CallbackContext):
+    """实时监听容器日志 N 秒。"""
+    name = require_arg(context, "/container_logstream <容器名>")
+    duration = LOG_STREAM_DURATION
+    chat_id = update.effective_chat.id
+    reply(update, f"📡 开始监听 {name} 日志 {duration} 秒...")
+
+    def _stream_worker():
+        try:
+            container = get_docker_client().containers.get(name)
+            buffer = []
+            for line in container.logs(stream=True, follow=True, since=int(time.time())):
+                buffer.append(line.decode("utf-8", errors="replace").rstrip())
+                if len(buffer) > 100:
+                    buffer = buffer[-50:]
+                if time.time() - start_time > duration:
+                    break
+            summary = "\n".join(buffer[-50:]) or "(无输出)"
+            if _bot_instance:
+                _bot_instance.send_message(
+                    chat_id=chat_id,
+                    text=f"📋 {name} 日志摘要（{duration}s）：\n\n{summary[:MESSAGE_LIMIT]}",
+                    disable_web_page_preview=True,
+                )
+        except Exception as e:
+            if _bot_instance:
+                _bot_instance.send_message(chat_id=chat_id, text=f"日志监听失败：{e}")
+
+    start_time = time.time()
+    threading.Thread(target=_stream_worker, daemon=True).start()
+
+
+# ─── #19 批量操作 ────────────────────────────────────────────
+@restricted
+def batch_menu_cmd(update: Update, context: CallbackContext):
+    """批量操作入口：展示容器列表供多选。"""
+    containers = get_docker_client().containers.list(all=True)
+    if not containers:
+        send_block(update, "批量操作", "暂无容器")
+        return
+
+    rows = []
+    # 每行最多 3 个按钮
+    batch = []
+    for c in containers[:15]:
+        batch.append(InlineKeyboardButton(
+            c.name[:15],
+            callback_data=callback_token("batch_select", c.name),
+        ))
+        if len(batch) == 3:
+            rows.append(batch)
+            batch = []
+    if batch:
+        rows.append(batch)
+
+    rows.append([
+        InlineKeyboardButton("🟢 全部启动", callback_data=callback_token("confirm:batch_start", "all")),
+        InlineKeyboardButton("🔴 全部停止", callback_data=callback_token("confirm:batch_stop", "all")),
+        InlineKeyboardButton("🔄 全部重启", callback_data=callback_token("confirm:batch_restart", "all")),
+    ])
+    rows.append([InlineKeyboardButton("返回主菜单", callback_data="menu:main")])
+    reply(update, "批量操作 — 选择操作：", InlineKeyboardMarkup(rows))
+
+
+def _do_batch_action(action, target):
+    """执行批量操作。"""
+    if target == "all":
+        containers = get_docker_client().containers.list(all=True)
+        names = [c.name for c in containers]
+    else:
+        names = [target]
+
+    results = []
+    for name in names:
+        try:
+            if action == "batch_start":
+                run_cmd(["docker", "start", name])
+            elif action == "batch_stop":
+                run_cmd(["docker", "stop", name])
+            elif action == "batch_restart":
+                run_cmd(["docker", "restart", name])
+            results.append(f"✅ {name}")
+        except Exception as e:
+            results.append(f"❌ {name}: {e}")
+    return "\n".join(results)
+
+
+# ─── #20 定时任务管理 (cron) ─────────────────────────────────
+_SCHEDULED_JOBS = {}  # job_id -> {"desc": str, "schedule": str, "command": str}
+
+
+@restricted
+def schedule_cmd(update: Update, context: CallbackContext):
+    """管理定时任务。"""
+    if not context.args or context.args[0] == "list":
+        if not _SCHEDULED_JOBS:
+            send_block(update, "定时任务", "暂无定时任务。\n\n用法：\n/schedule add <每日HH:MM> <命令>\n/schedule remove <ID>")
+            return
+        lines = ["定时任务列表：\n"]
+        for jid, job in _SCHEDULED_JOBS.items():
+            lines.append(f"  [{jid}] {job['schedule']} → {job['command']}")
+        send_block(update, "定时任务", "\n".join(lines))
+        return
+
+    sub = context.args[0]
+    if sub == "add":
+        if len(context.args) < 3:
+            raise ValueError("用法：/schedule add <每日HH:MM> <命令>\n命令支持：update_all, cleanup_safe, cleanup_standard, cleanup_deep, restart <服务名>")
+        schedule_str = safe_arg(context.args[1])
+        command = " ".join(context.args[2:])
+        jid = uuid.uuid4().hex[:6]
+        _SCHEDULED_JOBS[jid] = {"schedule": schedule_str, "command": command}
+        logger.info(f"用户 {update.effective_user.id} 添加定时任务 [{jid}]: {schedule_str} → {command}")
+        send_block(update, "定时任务", f"✅ 已添加定时任务 [{jid}]\n时间：{schedule_str}\n命令：{command}\n\n注意：定时任务在 bot 重启后需要重新添加（持久化开发中）。")
+    elif sub == "remove":
+        if len(context.args) < 2:
+            raise ValueError("用法：/schedule remove <ID>")
+        jid = safe_arg(context.args[1])
+        if jid in _SCHEDULED_JOBS:
+            del _SCHEDULED_JOBS[jid]
+            send_block(update, "定时任务", f"✅ 已删除定时任务 [{jid}]")
+        else:
+            raise ValueError(f"找不到任务 [{jid}]")
+    else:
+        raise ValueError("用法：/schedule [list|add|remove]")
+
+
+def scheduled_jobs_checker():
+    """后台线程：检查定时任务是否到时执行。"""
+    logger.info("定时任务检查线程已启动")
+    while True:
+        time.sleep(60)
+        try:
+            now = time.strftime("%H:%M")
+            today = time.strftime("%Y-%m-%d")
+            for jid, job in list(_SCHEDULED_JOBS.items()):
+                sched = job["schedule"]
+                # 支持 "每日HH:MM" 格式
+                if sched.startswith("每日") and sched[2:] == now:
+                    cmd = job["command"]
+                    if jid + today in _SCHEDULED_JOBS:  # 今天已执行过
+                        continue
+                    _SCHEDULED_JOBS[jid + today] = {"_executed": True}
+                    logger.info(f"执行定时任务 [{jid}]: {cmd}")
+                    _execute_scheduled_command(cmd)
+        except Exception as e:
+            logger.warning(f"定时任务检查异常: {e}", exc_info=True)
+
+
+def _execute_scheduled_command(cmd_str):
+    """执行定时任务命令。"""
+    try:
+        if cmd_str == "update_all":
+            output = run_compose("pull") + "\n" + run_compose("up", "-d")
+            _send_alert_to_all(f"⏰ 定时更新完成\n\n{output[:500]}")
+        elif cmd_str == "cleanup_safe":
+            output = run_cmd(["docker", "system", "prune", "-f"])
+            _send_alert_to_all(f"⏰ 定时安全清理完成\n\n{output[:500]}")
+        elif cmd_str == "cleanup_standard":
+            output = run_cmd(["docker", "system", "prune", "-af"])
+            _send_alert_to_all(f"⏰ 定时标准清理完成\n\n{output[:500]}")
+        elif cmd_str == "cleanup_deep":
+            output = run_cmd(["docker", "system", "prune", "-af", "--volumes"])
+            _send_alert_to_all(f"⏰ 定时深度清理完成\n\n{output[:500]}")
+        elif cmd_str.startswith("restart "):
+            svc = cmd_str.split(" ", 1)[1]
+            output = run_compose("restart", svc)
+            _send_alert_to_all(f"⏰ 定时重启 {svc} 完成\n\n{output[:500]}")
+        else:
+            _send_alert_to_all(f"⚠️ 未知定时任务命令：{cmd_str}")
+    except Exception as e:
+        _send_alert_to_all(f"❌ 定时任务执行失败：{cmd_str}\n\n{e}")
+
+
+# ─── #21 Compose 文件查看与验证 ──────────────────────────────
+@restricted
+def compose_view_cmd(update: Update, context: CallbackContext):
+    """查看 compose 配置。"""
+    try:
+        output = run_compose("config")
+        send_block(update, "Compose 配置", output)
+    except Exception as e:
+        send_block(update, "Compose 配置", f"获取失败：{e}")
+
+
+@restricted
+def compose_validate_cmd(update: Update, context: CallbackContext):
+    """验证 compose 配置语法。"""
+    try:
+        result = run_cmd(compose_cmd("config", "-q"), cwd=DOCKER_COMPOSE_DIR)
+        send_block(update, "配置验证", "✅ 配置语法有效" if not result else f"⚠️ {result}")
+    except Exception as e:
+        send_block(update, "配置验证", f"❌ 配置有误：{e}")
+
+
+# ─── #22 统计仪表盘 ──────────────────────────────────────────
+@restricted
+def stats_cmd(update: Update, context: CallbackContext):
+    """Docker 资源使用摘要。"""
+    client = get_docker_client()
+    info = client.info()
+    df = client.df()
+
+    # 容器统计
+    total_ctn = info.get("Containers", 0)
+    running = info.get("ContainersRunning", 0)
+    stopped = info.get("ContainersStopped", 0)
+    images_count = info.get("Images", 0)
+
+    # 磁盘统计
+    total_image_size = sum(i.get("Size", 0) for i in df.get("Images", []))
+    dangling_images = [i for i in df.get("Images", []) if not i.get("Containers")]
+    unused_image_size = sum(i.get("Size", 0) for i in dangling_images)
+
+    def fmt_size(n):
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if n < 1024:
+                return f"{n:.1f} {unit}"
+            n /= 1024
+
+    # 系统资源
+    cpu = psutil.cpu_percent(interval=1)
+    mem = psutil.virtual_memory()
+    disk = psutil.disk_usage("/")
+    load = os.getloadavg()
+
+    # 更新历史
+    history = get_update_history(limit=5)
+
+    lines = [
+        f"📊 Docker 资源摘要 — {time.strftime('%Y-%m-%d %H:%M')}",
+        "",
+        "🐳 容器概览：",
+        f"   运行中：{running}  停止：{stopped}  总计：{total_ctn}",
+        f"   镜像数：{images_count}",
+        "",
+        "💾 存储占用：",
+        f"   镜像总大小：{fmt_size(total_image_size)}",
+        f"   可清理镜像：{len(dangling_images)} 个（{fmt_size(unused_image_size)}）",
+        "",
+        "🖥 服务器资源：",
+        f"   CPU：{cpu:.1f}%  负载：{load[0]:.2f}/{load[1]:.2f}/{load[2]:.2f}",
+        f"   内存：{mem.used / 1024**3:.1f} / {mem.total / 1024**3:.1f} GB ({mem.percent:.0f}%)",
+        f"   磁盘：{disk.used / 1024**3:.1f} / {disk.total / 1024**3:.1f} GB ({disk.percent:.0f}%)",
+    ]
+
+    if history:
+        lines.append("")
+        lines.append("📋 最近更新：")
+        for ts, svc, img, old_d, new_d, status in history[:3]:
+            lines.append(f"   {ts}  {svc} ({status})")
+
+    send_block(update, "Docker 统计", "\n".join(lines))
+
+
+# ─── #23 安全增强 — 分级权限 + 审计 ──────────────────────────
+def restricted_admin(func):
+    """管理员权限装饰器：只允许 ADMIN_USER_IDS 中的用户。"""
+    @wraps(func)
+    def wrapper(update: Update, context: CallbackContext):
+        user = update.effective_user
+        if not user or user.id not in ADMIN_USER_IDS:
+            reply(update, "⛔ 此操作需要管理员权限。")
+            logger.warning(f"非管理员用户 {user.id} 尝试管理员操作 {func.__name__}")
+            return
+        return func(update, context)
+    return wrapper
+
+
+# 写操作集合 — readonly 用户被禁止执行
+_WRITE_COMMANDS = {
+    "service_start", "service_stop", "service_restart", "service_pull",
+    "service_update", "service_recreate", "service_add", "service_remove",
+    "scale", "container_start", "container_stop", "container_restart",
+    "container_update", "container_remove", "container_run",
+    "container_exec", "container_logstream",
+    "image_pull", "image_remove", "image_prune",
+    "volume_remove", "volume_prune", "network_prune",
+    "docker_prune", "rollback", "schedule",
+}
+
+
+def is_readonly_user(user_id):
+    """检查用户是否为只读权限。"""
+    return user_id in READONLY_USER_IDS and user_id not in ADMIN_USER_IDS
+
+
+def _audit_log(user_id, action, target, result="ok"):
+    """记录审计日志到 SQLite。"""
+    try:
+        conn = _get_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            user_id INTEGER,
+            action TEXT,
+            target TEXT,
+            result TEXT
+        )""")
+        conn.execute(
+            "INSERT INTO audit_log (timestamp, user_id, action, target, result) VALUES (?, ?, ?, ?, ?)",
+            (time.strftime("%Y-%m-%d %H:%M:%S"), user_id, action, target, result),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"审计日志写入失败: {e}")
+
+
+@restricted
+def audit_log_cmd(update: Update, context: CallbackContext):
+    """查看审计日志（仅管理员）。"""
+    user = update.effective_user
+    if user.id not in ADMIN_USER_IDS:
+        reply(update, "⛔ 此操作需要管理员权限。")
+        return
+    try:
+        conn = _get_db()
+        conn.execute("""CREATE TABLE IF NOT EXISTS audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            user_id INTEGER,
+            action TEXT,
+            target TEXT,
+            result TEXT
+        )""")
+        rows = conn.execute(
+            "SELECT timestamp, user_id, action, target, result FROM audit_log ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+        conn.close()
+        if not rows:
+            send_block(update, "审计日志", "暂无审计记录。")
+            return
+        lines = []
+        for ts, uid, act, tgt, res in rows:
+            lines.append(f"{ts}  user={uid}  {act}({tgt})  → {res}")
+        send_block(update, "审计日志（最近 20 条）", "\n".join(lines))
+    except Exception as e:
+        send_block(update, "审计日志", f"查询失败：{e}")
+
+
 def add_handlers(dp):
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("menu", menu))
@@ -1734,6 +2144,17 @@ def add_handlers(dp):
     dp.add_handler(CommandHandler("rollback", rollback_cmd))
     dp.add_handler(CommandHandler("compose_projects", compose_projects_cmd))
 
+    # Phase 4: 高级功能
+    dp.add_handler(CommandHandler("container_exec", container_exec_cmd))
+    dp.add_handler(CommandHandler("container_logs", container_logs_cmd))
+    dp.add_handler(CommandHandler("container_logstream", container_logstream_cmd))
+    dp.add_handler(CommandHandler("batch", batch_menu_cmd))
+    dp.add_handler(CommandHandler("schedule", schedule_cmd))
+    dp.add_handler(CommandHandler("compose_view", compose_view_cmd))
+    dp.add_handler(CommandHandler("compose_validate", compose_validate_cmd))
+    dp.add_handler(CommandHandler("stats", stats_cmd))
+    dp.add_handler(CommandHandler("audit_log", audit_log_cmd))
+
     # 旧命令兼容。
     dp.add_handler(CommandHandler("update", service_update))
     dp.add_handler(CommandHandler("start_service", service_start))
@@ -1766,6 +2187,12 @@ def set_bot_commands(updater: Updater):
                 BotCommand("history", "查看更新历史"),
                 BotCommand("rollback", "回滚服务版本"),
                 BotCommand("compose_projects", "列出 compose 项目"),
+                BotCommand("stats", "查看 Docker 资源摘要"),
+                BotCommand("batch", "批量操作容器"),
+                BotCommand("schedule", "管理定时任务"),
+                BotCommand("compose_view", "查看 compose 配置"),
+                BotCommand("compose_validate", "验证 compose 配置"),
+                BotCommand("audit_log", "查看审计日志"),
             ]
         )
     except TelegramError as e:
@@ -1821,6 +2248,7 @@ def main():
         threading.Thread(target=resource_monitor, daemon=True).start()
     if ENABLE_UPDATE_CHECKER:
         threading.Thread(target=update_checker_loop, daemon=True).start()
+    threading.Thread(target=scheduled_jobs_checker, daemon=True).start()
 
     logger.info("机器人已启动，开始接收消息")
     updater.idle()
