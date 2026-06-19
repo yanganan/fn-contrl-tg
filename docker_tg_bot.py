@@ -56,6 +56,27 @@ COMPOSE_BIN = None
 # ─── 操作并发锁 (#9) ─────────────────────────────────────────
 _operation_lock = threading.Lock()
 
+# ─── 异步操作追踪 (#10) ──────────────────────────────────────
+_active_ops = {}  # chat_id -> operation description
+_bot_instance = None  # 在 main() 中赋值，供后台线程发消息
+
+# ─── 监控配置 (#11, #12) ─────────────────────────────────────
+ENABLE_EVENT_MONITOR = os.getenv("ENABLE_EVENT_MONITOR", "true").strip().lower() in ("true", "1", "yes")
+EVENT_IGNORE = {s.strip() for s in os.getenv("EVENT_IGNORE", "").split(",") if s.strip()}
+ENABLE_RESOURCE_MONITOR = os.getenv("ENABLE_RESOURCE_MONITOR", "true").strip().lower() in ("true", "1", "yes")
+DISK_THRESHOLD = int(os.getenv("DISK_THRESHOLD", "85"))
+MEM_THRESHOLD = int(os.getenv("MEM_THRESHOLD", "90"))
+CPU_THRESHOLD = int(os.getenv("CPU_THRESHOLD", "95"))
+RESOURCE_CHECK_INTERVAL = int(os.getenv("RESOURCE_CHECK_INTERVAL", "60"))
+ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "1800"))  # 30 分钟
+
+# 定义哪些操作需要异步执行（可能耗时较长）
+LONG_OPERATIONS = {
+    "svc_update", "svc_update_all", "ctr_update",
+    "cleanup_safe", "cleanup_standard", "cleanup_deep",
+    "container_run",
+}
+
 
 # ─── Docker 客户端延迟初始化 (#4) ────────────────────────────
 _docker_client = None
@@ -79,6 +100,236 @@ def get_docker_client():
 
 
 # ─── Token 过期清理 (#2) ─────────────────────────────────────
+def _send_alert_to_all(text: str, markup=None):
+    """向所有允许用户推送告警消息（供后台监控线程调用）。"""
+    if _bot_instance is None:
+        logger.warning("bot 实例未初始化，无法发送告警")
+        return
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            _bot_instance.send_message(
+                chat_id=user_id,
+                text=text,
+                reply_markup=markup,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.error(f"发送告警到 {user_id} 失败: {e}")
+
+
+# ─── 长操作异步化 (#10) ──────────────────────────────────────
+def _async_execute(update: Update, action: str, target: str):
+    """在后台线程执行长操作，完成后推送结果。"""
+    global _active_ops
+    chat_id = update.effective_chat.id
+    op_desc = f"{action}({target})"
+    _active_ops[chat_id] = op_desc
+    logger.info(f"异步操作已启动: {op_desc}")
+
+    try:
+        output = _do_action(action, target)
+        logger.info(f"异步操作完成: {op_desc}")
+        if _bot_instance:
+            body = output[:MESSAGE_LIMIT]
+            _bot_instance.send_message(
+                chat_id=chat_id,
+                text=f"✅ 操作完成：{op_desc}\n\n{body}",
+                disable_web_page_preview=True,
+            )
+    except Exception as e:
+        logger.error(f"异步操作失败: {op_desc}: {e}", exc_info=True)
+        if _bot_instance:
+            _bot_instance.send_message(
+                chat_id=chat_id,
+                text=f"❌ 操作失败：{op_desc}\n\n{e}",
+                disable_web_page_preview=True,
+            )
+    finally:
+        _active_ops.pop(chat_id, None)
+        _operation_lock.release()
+
+
+def _do_action(action: str, target: str) -> str:
+    """实际执行操作的纯函数（不含锁逻辑），返回输出。"""
+    if action == "svc_start":
+        return run_compose("start", target)
+    elif action == "svc_stop":
+        return run_compose("stop", target)
+    elif action == "svc_restart":
+        return run_compose("restart", target)
+    elif action == "svc_update":
+        return run_compose("pull", target) + "\n" + run_compose("up", "-d", target)
+    elif action == "svc_update_all":
+        return run_compose("pull") + "\n" + run_compose("up", "-d")
+    elif action == "ctr_start":
+        return run_cmd(["docker", "start", target])
+    elif action == "ctr_stop":
+        return run_cmd(["docker", "stop", target])
+    elif action == "ctr_restart":
+        return run_cmd(["docker", "restart", target])
+    elif action == "ctr_update":
+        return update_container_by_name(target)
+    elif action == "docker_prune":
+        return run_cmd(["docker", "system", "prune", "-f"])
+    elif action == "cleanup_safe":
+        return run_cmd(["docker", "system", "prune", "-f"])
+    elif action == "cleanup_standard":
+        return run_cmd(["docker", "system", "prune", "-af"])
+    elif action == "cleanup_deep":
+        return run_cmd(["docker", "system", "prune", "-af", "--volumes"])
+    elif action == "volume_prune":
+        return run_cmd(["docker", "volume", "prune", "-f"])
+    elif action == "image_prune":
+        return run_cmd(["docker", "image", "prune", "-f"])
+    elif action == "service_remove":
+        return run_compose("rm", "-sf", target)
+    elif action == "container_remove":
+        return run_cmd(["docker", "rm", "-f", target])
+    elif action == "image_remove":
+        return run_cmd(["docker", "rmi", target])
+    elif action == "volume_remove":
+        return run_cmd(["docker", "volume", "rm", target])
+    elif action == "network_prune":
+        return run_cmd(["docker", "network", "prune", "-f"])
+    elif action == "container_run":
+        return run_cmd(shlex.split(target))
+    else:
+        return f"未知操作：{action}"
+
+
+# ─── Docker 事件监听 (#11) ───────────────────────────────────
+def docker_event_monitor():
+    """后台线程：监听 Docker 事件，容器异常退出 / OOM / 健康检查失败时告警。"""
+    logger.info("Docker 事件监听线程已启动")
+    while True:
+        try:
+            client = get_docker_client()
+            for event in client.events(
+                decode=True,
+                filters={"event": ["die", "oom", "health_status: unhealthy"]},
+            ):
+                _handle_docker_event(event)
+        except Exception as e:
+            logger.warning(f"事件监听异常，10 秒后重连: {e}", exc_info=True)
+            time.sleep(10)
+
+
+def _handle_docker_event(event: dict):
+    """处理单个 Docker 事件。"""
+    status = event.get("status", "")
+    attrs = event.get("Actor", {}).get("Attributes", {})
+    name = attrs.get("name", "unknown")
+
+    # 忽略指定容器
+    if name in EVENT_IGNORE:
+        return
+
+    # 忽略 bot 自身
+    if name == "docker-tg-bot":
+        return
+
+    if status == "die":
+        exit_code = attrs.get("exitCode", "?")
+        # 正常退出（exit code 0）只记录日志
+        if str(exit_code) == "0":
+            logger.info(f"容器 {name} 正常退出 (exit=0)，不发送告警")
+            return
+
+        # 获取最后日志
+        log_tail = ""
+        try:
+            container = get_docker_client().containers.get(name)
+            log_bytes = container.logs(tail=5)
+            log_tail = log_bytes.decode("utf-8", errors="replace")[:300].strip()
+        except Exception:
+            pass
+
+        # 判断退出原因
+        oom_killed = attrs.get("OOMKilled", "false") == "true"
+        emoji = "🔴" if oom_killed else "⚠️"
+        reason = "OOM Killed（内存不足）" if oom_killed else f"退出码 {exit_code}"
+
+        msg = (
+            f"{emoji} 容器异常退出\n"
+            f"容器：{name}\n"
+            f"原因：{reason}\n"
+        )
+        if log_tail:
+            msg += f"最后日志：\n{log_tail}\n"
+
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"重启 {name}", callback_data=callback_token("confirm:ctr_restart", name))]]
+        )
+        _send_alert_to_all(msg, keyboard)
+        logger.warning(f"Docker 事件告警: {name} {reason}")
+
+    elif status == "oom":
+        _send_alert_to_all(f"🔴 容器 {name} 被 OOM Killed！内存不足。")
+        logger.warning(f"Docker OOM 事件: {name}")
+
+    elif "health_status" in status or status == "health_status":
+        health = attrs.get("healthStatus", attrs.get("status", ""))
+        if "unhealthy" in str(health).lower():
+            _send_alert_to_all(f"🔴 容器 {name} 健康检查失败：{health}")
+            logger.warning(f"Docker 健康检查失败: {name}")
+
+
+# ─── 资源阈值监控 (#12) ──────────────────────────────────────
+_last_alert = {}  # alert_type -> timestamp
+
+
+def _check_and_alert(alert_type: str, message: str, markup=None):
+    """发送告警，但受 ALERT_COOLDOWN 冷却期限制。"""
+    now = time.time()
+    last = _last_alert.get(alert_type, 0)
+    if now - last < ALERT_COOLDOWN:
+        return
+    _last_alert[alert_type] = now
+    _send_alert_to_all(message, markup)
+    logger.warning(f"资源告警 [{alert_type}]: {message[:80]}")
+
+
+def resource_monitor():
+    """后台线程：定期检查 CPU/内存/磁盘，超过阈值时告警。"""
+    logger.info(f"资源监控线程已启动 (间隔={RESOURCE_CHECK_INTERVAL}s)")
+    while True:
+        time.sleep(RESOURCE_CHECK_INTERVAL)
+        try:
+            # 磁盘
+            disk = psutil.disk_usage("/")
+            if disk.percent >= DISK_THRESHOLD:
+                free_gb = disk.free / 1024**3
+                keyboard = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🧹 快速清理", callback_data="menu:cleanup")]]
+                )
+                _check_and_alert(
+                    "disk",
+                    f"🔴 磁盘空间不足！\n使用率：{disk.percent:.1f}%\n剩余：{free_gb:.1f} GB\n建议清理不需要的镜像和容器。",
+                    keyboard,
+                )
+
+            # 内存
+            mem = psutil.virtual_memory()
+            if mem.percent >= MEM_THRESHOLD:
+                _check_and_alert(
+                    "mem",
+                    f"🔴 内存不足！\n使用率：{mem.percent:.1f}%\n"
+                    f"已用：{mem.used / 1024**3:.1f} GB / {mem.total / 1024**3:.1f} GB",
+                )
+
+            # CPU（采样 5 秒以获得更稳定的读数）
+            cpu = psutil.cpu_percent(interval=5)
+            if cpu >= CPU_THRESHOLD:
+                _check_and_alert(
+                    "cpu",
+                    f"🟡 CPU 使用率过高：{cpu:.1f}%\n"
+                    f"负载：{os.getloadavg()[0]:.2f}",
+                )
+
+        except Exception as e:
+            logger.warning(f"资源监控异常: {e}", exc_info=True)
+
+
 def cleanup_expired_tokens():
     """后台线程：定期清理过期的 token，防止内存泄漏。"""
     while True:
@@ -664,60 +915,34 @@ def text_menu_router(update: Update, context: CallbackContext):
         help_command(update, context)
 
 
-# ─── 操作执行：带并发锁 (#9) + 日志 (#5) ─────────────────────
+# ─── 操作执行：带并发锁 (#9) + 日志 (#5) + 异步化 (#10) ──────
 def execute_confirmed_action(update: Update, action: str, target: str):
     # 尝试获取锁，防止并发冲突操作
     if not _operation_lock.acquire(blocking=False):
         reply(update, "⚠️ 有其他操作正在执行中，请等待完成后再试。", main_menu())
         return
+
+    chat_id = update.effective_chat.id
+    if chat_id in _active_ops:
+        _operation_lock.release()
+        reply(update, "⚠️ 你有一个操作正在后台执行中。", main_menu())
+        return
+
+    # 长操作异步执行
+    if action in LONG_OPERATIONS:
+        op_name = f"{action}({target})"
+        reply(update, f"⏳ {op_name} 已提交后台执行，完成后会通知你。", main_menu())
+        threading.Thread(
+            target=_async_execute,
+            args=(update, action, target),
+            daemon=True,
+        ).start()
+        return
+
+    # 短操作同步执行
     try:
         logger.info(f"执行操作: action={action}, target={target}")
-        if action == "svc_start":
-            output = run_compose("start", target)
-        elif action == "svc_stop":
-            output = run_compose("stop", target)
-        elif action == "svc_restart":
-            output = run_compose("restart", target)
-        elif action == "svc_update":
-            output = run_compose("pull", target) + "\n" + run_compose("up", "-d", target)
-        elif action == "svc_update_all":
-            output = run_compose("pull") + "\n" + run_compose("up", "-d")
-        elif action == "ctr_start":
-            output = run_cmd(["docker", "start", target])
-        elif action == "ctr_stop":
-            output = run_cmd(["docker", "stop", target])
-        elif action == "ctr_restart":
-            output = run_cmd(["docker", "restart", target])
-        elif action == "ctr_update":
-            output = update_container_by_name(target)
-        elif action == "docker_prune":
-            # ─── 改为标准清理而非最激进 (#8) ──────────────────
-            output = run_cmd(["docker", "system", "prune", "-f"])
-        elif action == "cleanup_safe":
-            output = run_cmd(["docker", "system", "prune", "-f"])
-        elif action == "cleanup_standard":
-            output = run_cmd(["docker", "system", "prune", "-af"])
-        elif action == "cleanup_deep":
-            output = run_cmd(["docker", "system", "prune", "-af", "--volumes"])
-        elif action == "volume_prune":
-            output = run_cmd(["docker", "volume", "prune", "-f"])
-        elif action == "image_prune":
-            # ─── image prune 默认只清理悬空镜像 (#8) ──────────
-            output = run_cmd(["docker", "image", "prune", "-f"])
-        elif action == "service_remove":
-            output = run_compose("rm", "-sf", target)
-        elif action == "container_remove":
-            output = run_cmd(["docker", "rm", "-f", target])
-        elif action == "image_remove":
-            output = run_cmd(["docker", "rmi", target])
-        elif action == "volume_remove":
-            output = run_cmd(["docker", "volume", "rm", target])
-        elif action == "network_prune":
-            output = run_cmd(["docker", "network", "prune", "-f"])
-        elif action == "container_run":
-            output = run_cmd(shlex.split(target))
-        else:
-            output = f"未知操作：{action}"
+        output = _do_action(action, target)
         logger.info(f"操作完成: action={action}, target={target}")
         send_block(update, "执行完成", output)
     except Exception as e:
@@ -1085,6 +1310,10 @@ def bot_info(update: Update, context: CallbackContext):
             f"允许用户数：{len(ALLOWED_USER_IDS)}",
             f"日志级别：{logging.getLevelName(logger.getEffectiveLevel())}",
             f"待处理 token：callback={len(CALLBACK_ACTIONS)}, pending={len(PENDING_ACTIONS)}",
+            f"后台操作：{len(_active_ops)} 个进行中",
+            f"事件监听：{'✅开' if ENABLE_EVENT_MONITOR else '❌关'}",
+            f"资源监控：{'✅开' if ENABLE_RESOURCE_MONITOR else '❌关'}"
+            + (f"（磁盘>{DISK_THRESHOLD}% 内存>{MEM_THRESHOLD}% CPU>{CPU_THRESHOLD}%）" if ENABLE_RESOURCE_MONITOR else ""),
         ]
     )
     send_block(update, "机器人运行信息", body)
@@ -1210,20 +1439,28 @@ def heartbeat_loop():
 
 
 def main():
+    global _bot_instance
     if not TELEGRAM_TOKEN:
         raise RuntimeError("请在 .env 中配置 TELEGRAM_TOKEN")
     if not ALLOWED_USER_IDS:
         raise RuntimeError("请在 .env 中配置 ALLOWED_USER_ID 或 ALLOWED_USER_IDS")
 
-    # 启动后台线程：token 清理 (#2) + 心跳 (#7)
-    threading.Thread(target=cleanup_expired_tokens, daemon=True).start()
-    threading.Thread(target=heartbeat_loop, daemon=True).start()
-
     logger.info("Docker 管理机器人启动中...")
     updater = Updater(TELEGRAM_TOKEN, use_context=True, request_kwargs=telegram_request_kwargs())
+    _bot_instance = updater.bot  # 供后台监控线程使用
+
     add_handlers(updater.dispatcher)
     set_bot_commands(updater)
     updater.start_polling()
+
+    # 启动后台线程
+    threading.Thread(target=cleanup_expired_tokens, daemon=True).start()
+    threading.Thread(target=heartbeat_loop, daemon=True).start()
+    if ENABLE_EVENT_MONITOR:
+        threading.Thread(target=docker_event_monitor, daemon=True).start()
+    if ENABLE_RESOURCE_MONITOR:
+        threading.Thread(target=resource_monitor, daemon=True).start()
+
     logger.info("机器人已启动，开始接收消息")
     updater.idle()
 
