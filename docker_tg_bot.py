@@ -39,6 +39,7 @@ ALLOWED_USER_IDS = {
 DOCKER_COMPOSE_DIR = os.getenv("DOCKER_COMPOSE_DIR", "/opt/docker-services")
 DOCKER_COMPOSE_FILE = os.getenv("DOCKER_COMPOSE_FILE", "")
 COMMAND_TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "120"))
+PULL_TIMEOUT = int(os.getenv("PULL_TIMEOUT", "1000"))  # 镜像拉取默认 1000s
 LOG_TAIL = int(os.getenv("LOG_TAIL", "80"))
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "").strip()
 TELEGRAM_CONNECT_TIMEOUT = float(os.getenv("TELEGRAM_CONNECT_TIMEOUT", "15"))
@@ -415,13 +416,13 @@ def _do_action(action: str, target: str) -> str:
         return run_compose("restart", target)
     elif action == "svc_update":
         old_digest = _get_image_digest(_get_service_image(target) or "")
-        output = run_compose("pull", target) + "\n" + run_compose("up", "-d", target)
+        output = run_compose("pull", target, timeout=PULL_TIMEOUT) + "\n" + run_compose("up", "-d", target)
         new_digest = _get_image_digest(_get_service_image(target) or "")
         record_update_history(target, _get_service_image(target), old_digest, new_digest, "updated")
         return output
     elif action == "svc_update_all":
         services = list_compose_services()
-        output = run_compose("pull") + "\n" + run_compose("up", "-d")
+        output = run_compose("pull", timeout=PULL_TIMEOUT) + "\n" + run_compose("up", "-d")
         for svc in services:
             img = _get_service_image(svc) or ""
             new_d = _get_image_digest(img)
@@ -743,8 +744,8 @@ def compose_cmd(*args):
     cmd.extend(args)
     return cmd
 
-def run_compose(*args):
-    return run_cmd(compose_cmd(*args), cwd=DOCKER_COMPOSE_DIR)
+def run_compose(*args, timeout=COMMAND_TIMEOUT):
+    return run_cmd(compose_cmd(*args), cwd=DOCKER_COMPOSE_DIR, timeout=timeout)
 
 
 def safe_arg(value: str) -> str:
@@ -1241,11 +1242,11 @@ def update_container_by_name(name: str) -> str:
     if compose_service and compose_project:
         return (
             f"检测到 compose 容器，按服务更新：{compose_service}\n"
-            + run_compose("pull", compose_service)
+            + run_compose("pull", compose_service, timeout=PULL_TIMEOUT)
             + "\n"
             + run_compose("up", "-d", compose_service)
         )
-    pull_output = run_cmd(["docker", "pull", image], timeout=600) if ":" in image and not image.startswith("sha256:") else f"镜像 {image} 没有可拉取的标签，跳过 pull。"
+    pull_output = run_cmd(["docker", "pull", image], timeout=PULL_TIMEOUT) if ":" in image and not image.startswith("sha256:") else f"镜像 {image} 没有可拉取的标签，跳过 pull。"
     restart_output = run_cmd(["docker", "restart", name])
     return (
         f"检测到非 compose 容器：{name}\n"
@@ -1337,7 +1338,7 @@ def service_restart(update: Update, context: CallbackContext):
 def service_pull(update: Update, context: CallbackContext):
     service = safe_arg(context.args[0]) if context.args else None
     args = ["pull"] + ([service] if service else [])
-    send_block(update, f"拉取镜像 {service or '全部服务'}", run_compose(*args))
+    send_block(update, f"拉取镜像 {service or '全部服务'}", run_compose(*args, timeout=PULL_TIMEOUT))
 
 
 @restricted
@@ -1345,7 +1346,7 @@ def service_update(update: Update, context: CallbackContext):
     service = safe_arg(context.args[0]) if context.args else None
     pull_args = ["pull"] + ([service] if service else [])
     up_args = ["up", "-d"] + ([service] if service else [])
-    output = run_compose(*pull_args) + "\n" + run_compose(*up_args)
+    output = run_compose(*pull_args, timeout=PULL_TIMEOUT) + "\n" + run_compose(*up_args)
     send_block(update, f"更新服务 {service or '全部服务'}", output)
 
 
