@@ -18,6 +18,8 @@ services:
       # DOCKER_COMPOSE_FILE: "/vol1/1000/docker-services/docker-compose.yml"
 
       COMMAND_TIMEOUT: "120"
+      # 镜像拉取超时（默认为 COMMAND_TIMEOUT × 5 = 600s）。大镜像下载慢时适当调大。
+      PULL_TIMEOUT: "600"
       LOG_TAIL: "80"
       LOG_LEVEL: "INFO"
 
