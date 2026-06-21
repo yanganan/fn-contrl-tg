@@ -11,7 +11,7 @@ services:
       DOCKER_COMPOSE_DIR: "/vol1/1000/docker-services"
       # DOCKER_COMPOSE_FILE: "/vol1/1000/docker-services/docker-compose.yml"
       COMMAND_TIMEOUT: "120"
-      PULL_TIMEOUT: "600"
+      PULL_TIMEOUT: "1000"
       LOG_TAIL: "80"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
