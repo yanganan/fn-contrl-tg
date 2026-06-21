@@ -20,6 +20,8 @@ services:
       COMMAND_TIMEOUT: "120"
       # 镜像拉取超时（默认 1000s）。大镜像下载慢时适当调大。
       PULL_TIMEOUT: "1000"
+      # compose up / 重建超时（默认 1000s）。超时会导致旧容器变孤儿（如 26ba50991af8_cms）。
+      UP_TIMEOUT: "1000"
       LOG_TAIL: "80"
       LOG_LEVEL: "INFO"
 
